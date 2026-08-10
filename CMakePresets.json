@@ -1,0 +1,85 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "wsl-debug",
+      "displayName": "WSL Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-wsl",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "COLITE_BUILD_TESTS": "ON",
+        "COLITE_ENABLE_CUDA_SIFT": "OFF",
+        "COLITE_ENABLE_CUDA_MATCHER": "OFF",
+        "COLITE_ENABLE_CUDA_MVS": "OFF"
+      }
+    },
+    {
+      "name": "wsl-release",
+      "displayName": "WSL Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-wsl-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "COLITE_BUILD_TESTS": "ON",
+        "COLITE_ENABLE_CUDA_SIFT": "OFF",
+        "COLITE_ENABLE_CUDA_MATCHER": "OFF",
+        "COLITE_ENABLE_CUDA_MVS": "OFF"
+      }
+    },
+    {
+      "name": "wsl-colite-cuda",
+      "displayName": "WSL Colite CUDA Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-wsl-colite-cuda",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "COLITE_BUILD_TESTS": "ON",
+        "COLITE_ENABLE_AVX2": "ON",
+        "COLITE_ENABLE_SIFT_PARALLEL": "ON",
+        "COLITE_ENABLE_CUDA_SIFT": "ON",
+        "COLITE_ENABLE_CUDA_MATCHER": "ON",
+        "COLITE_ENABLE_CUDA_MVS": "ON",
+        "COLITE_ENABLE_POISSON_MESHING": "ON",
+        "COLITE_ENABLE_DELAUNAY_MESHING": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "wsl-debug",
+      "configurePreset": "wsl-debug"
+    },
+    {
+      "name": "wsl-release",
+      "configurePreset": "wsl-release"
+    },
+    {
+      "name": "wsl-colite-cuda",
+      "configurePreset": "wsl-colite-cuda"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "wsl-debug",
+      "configurePreset": "wsl-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "wsl-release",
+      "configurePreset": "wsl-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "wsl-colite-cuda",
+      "configurePreset": "wsl-colite-cuda",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
