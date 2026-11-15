@@ -13,7 +13,7 @@
 
 namespace colite {
 
-// 图像对键。始终按较小 ID 在前存储，减少 (i,j)/(j,i) 重复。
+// MatchGraph键用Ordered规范化，减少(i,j)/(j,i)重复；初始对可保留首/次图像方向。
 struct ImagePair {
   ImageId image_id1 = kInvalidImageId;
   ImageId image_id2 = kInvalidImageId;
@@ -71,6 +71,8 @@ const std::vector<FeatureMatch>* FindMatches(const MatchGraph& graph,
 const TwoViewGeometry* FindVerifiedGeometry(const MatchGraph& graph,
                                             ImageId image_id1,
                                             ImageId image_id2);
+
+TwoViewGeometry ReverseTwoViewGeometry(const TwoViewGeometry& geometry);
 
 // 查询某张图像所有已验证邻居，并按内点数从多到少排序。
 std::vector<MatchGraphEdge> FindVerifiedNeighbors(const MatchGraph& graph,

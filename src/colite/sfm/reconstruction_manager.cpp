@@ -1,4 +1,5 @@
 #include "colite/sfm/reconstruction_manager.h"
+#include <glog/logging.h>
 
 #include <algorithm>
 #include <cmath>
@@ -37,9 +38,7 @@ struct PointPair {
 };
 
 bool IsUsableGeometry(const TwoViewGeometry& geometry) {
-  return geometry.type != TwoViewGeometry::Type::kUndefined &&
-         geometry.type != TwoViewGeometry::Type::kDegenerate &&
-         !geometry.inlier_matches.empty();
+  return geometry.HasUsableCorrespondences();
 }
 
 Reconstruction CloneSchema(const Reconstruction& source) {
@@ -459,6 +458,21 @@ MultiModelMappingResult RunIncrementalMappingMultiple(
   MultiModelMappingResult result;
   const Reconstruction schema = CloneSchema(schema_or_seed);
   std::set<ImageId> consumed;
+  std::set<ImageId> image_ids;
+  for (const auto& [image_id, image] : schema.Images()) {
+    (void)image;
+    image_ids.insert(image_id);
+  }
+  // COLMAP sizes this limit from its connected database cache, excluding
+  // images with no usable correspondences. Compute it once for all models,
+  // not from the shrinking remainder or from each individual component.
+  std::size_t num_connected_images = 0;
+  for (const auto& component : VerifiedComponents(graph, image_ids)) {
+    if (component.size() >= 2) num_connected_images += component.size();
+  }
+  const std::size_t min_model_size = std::min(
+      options.min_num_images_per_model, num_connected_images / 2);
+  std::size_t initialization_trials = 0;
 
   if (!schema_or_seed.RegisteredImageIds().empty()) {
     ValidateAndCompleteSeedFeatures(graph, &schema_or_seed);
@@ -466,7 +480,10 @@ MultiModelMappingResult RunIncrementalMappingMultiple(
     mapping.allowed_image_ids.clear();
     IncrementalMappingSummary summary =
         RunIncrementalMapping(graph, mapping, &schema_or_seed);
-    if (summary.success) {
+    // Continuing an existing model is the first reconstruction attempt in
+    // COLMAP's outer trial loop, even though no initial pair is estimated.
+    ++initialization_trials;
+    if (summary.success && !schema_or_seed.Points3D().empty()) {
       consumed.insert(schema_or_seed.RegisteredImageIds().begin(),
                       schema_or_seed.RegisteredImageIds().end());
       result.models.push_back(std::move(schema_or_seed));
@@ -474,39 +491,67 @@ MultiModelMappingResult RunIncrementalMappingMultiple(
     }
   }
 
-  while (result.models.size() < options.max_num_models) {
-    std::set<ImageId> remaining;
-    for (const auto& [image_id, image] : schema.Images()) {
-      (void)image;
-      if (consumed.count(image_id) == 0) {
-        remaining.insert(image_id);
-      }
+  auto round_mapping = options.mapping;
+  round_mapping.relax_initialization_constraints = false;
+  const int num_relaxations = options.mapping.relax_initialization_constraints ? 4 : 0;
+  for (int round = 0; round <= num_relaxations &&
+       result.models.size() < options.max_num_models; ++round) {
+    if (round > 0) {
+      initialization_trials = 0;
+      if (round % 2 == 1)
+        round_mapping.initialization.min_num_inliers = std::max<std::size_t>(
+            1, round_mapping.initialization.min_num_inliers / 2);
+      else round_mapping.initialization.min_triangulation_angle_deg *= .5;
     }
-    bool made_progress = false;
-    for (const std::set<ImageId>& component :
-         VerifiedComponents(graph, remaining)) {
-      if (component.size() < options.min_num_images_per_model ||
-          result.models.size() >= options.max_num_models) {
-        continue;
+    InitialPairTrialState initial_trial_state;
+    while (result.models.size() < options.max_num_models &&
+           initialization_trials < options.mapping.max_num_initialization_trials) {
+      std::set<ImageId> remaining;
+      for (const auto& [image_id, image] : schema.Images()) {
+        (void)image;
+        if (consumed.count(image_id) == 0) {
+          remaining.insert(image_id);
+        }
       }
-      Reconstruction model = CloneSchema(schema);
-      IncrementalMappingOptions mapping = options.mapping;
-      mapping.allowed_image_ids = component;
-      mapping.initialization.allowed_image_ids = component;
-      IncrementalMappingSummary summary =
-          RunIncrementalMapping(graph, mapping, &model);
-      if (!summary.success ||
-          summary.num_registered_images < options.min_num_images_per_model) {
-        continue;
+      bool made_progress = false;
+      for (const std::set<ImageId>& component :
+           VerifiedComponents(graph, remaining)) {
+        if (initialization_trials >= options.mapping.max_num_initialization_trials) break;
+        // Even a component below the configured size can produce the first
+        // valid model. Later components cannot meet the limit if already smaller.
+        if (component.size() < 2 ||
+            (!result.models.empty() && component.size() < min_model_size) ||
+            result.models.size() >= options.max_num_models) {
+          VLOG(1) << "Skipping verified component: images=" << component.size()
+                  << " min_model_size=" << min_model_size;
+          continue;
+        }
+        Reconstruction model = CloneSchema(schema);
+        IncrementalMappingOptions mapping = round_mapping;
+        mapping.max_num_initialization_trials -= initialization_trials;
+        mapping.allowed_image_ids = component;
+        mapping.initialization.allowed_image_ids = component;
+        IncrementalMappingSummary summary =
+            RunIncrementalMapping(graph, mapping, &model, &initial_trial_state);
+        initialization_trials += summary.initialization_refinements.size();
+        if (!summary.success || model.Points3D().empty() ||
+            (!result.models.empty() &&
+             summary.num_registered_images < min_model_size)) {
+          LOG(INFO) << "Mapper attempt rejected: registered=" << summary.num_registered_images
+                    << " min_model_size=" << min_model_size
+                    << " message=" << summary.message
+                    << " initialization=" << summary.initialization.message;
+          continue;
+        }
+        consumed.insert(model.RegisteredImageIds().begin(),
+                        model.RegisteredImageIds().end());
+        result.models.push_back(std::move(model));
+        result.mapping_summaries.push_back(std::move(summary));
+        made_progress = true;
       }
-      consumed.insert(model.RegisteredImageIds().begin(),
-                      model.RegisteredImageIds().end());
-      result.models.push_back(std::move(model));
-      result.mapping_summaries.push_back(std::move(summary));
-      made_progress = true;
-    }
-    if (!made_progress) {
-      break;
+      if (!made_progress) {
+        break;
+      }
     }
   }
 

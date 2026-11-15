@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <map>
+#include <memory>
 
 #include "colite/core/camera.h"
 #include "colite/core/match_graph.h"
@@ -10,6 +11,9 @@
 #include "colite/matching/two_view_geometry_verifier.h"
 
 namespace colite {
+
+using PreparedFeatureMatcherCache =
+    std::map<ImageId, std::unique_ptr<PreparedFeatureMatcher>>;
 
 struct WeakPairRematchingOptions {
   // Zero applies guided re-matching to every pair; positive values restrict
@@ -34,11 +38,13 @@ struct WeakPairRematchingSummary {
   double geometry_verification_work_seconds = 0.0;
 };
 
-// 对弱相邻图像对执行二阶段重匹配：更宽松描述子候选 -> guided filtering ->
-// 两视图几何重验证。只有内点数有明确收益时才更新 MatchGraph。
+// Reuse the verified geometry for guided descriptor re-search. An optional
+// complete cache must use relaxed_matching.backend; with it, graph features
+// may contain keypoints only. Only pairs with a clear inlier gain are updated.
 WeakPairRematchingSummary RematchWeakImagePairs(
     const std::map<ImageId, Camera>& cameras_by_image,
     const WeakPairRematchingOptions& options,
-    MatchGraph* graph);
+    MatchGraph* graph,
+    const PreparedFeatureMatcherCache* prepared_cache = nullptr);
 
 }  // namespace colite

@@ -1,6 +1,7 @@
 #include "colite/sfm/global_bundle_adjuster.h"
 
 #include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -232,6 +233,118 @@ TEST(GlobalBundleAdjusterTest, AppliesTwoImageGaugeWhenNoConstantsAreGiven) {
   EXPECT_EQ(summary.num_gauge_constant_translation_images, 1U);
 }
 
+TEST(GlobalBundleAdjusterTest, ScaleGaugeHandlesVerticalBaselineAndFixedPose) {
+  for (const bool explicit_anchor : {false, true}) {
+    const Camera camera = MakeCamera();
+    const Eigen::Vector3d anchor(12.0, -4.0, 3.0);
+    auto points = MakeScenePoints();
+    for (auto& point : points) point += anchor;
+    const std::vector<Pose3> poses = {
+        CameraAt(anchor), CameraAt(anchor + Eigen::Vector3d(0, 1, 0)),
+        CameraAt(anchor + Eigen::Vector3d(0.3, 0.5, 0.1))};
+    Reconstruction reconstruction;
+    reconstruction.AddCamera(camera);
+    for (std::size_t idx = 0; idx < poses.size(); ++idx) {
+      auto image = MakeRegisteredImage(idx + 1, poses[idx]);
+      AddImageObservations(camera, poses[idx], &image, points);
+      reconstruction.AddImage(image);
+    }
+    for (std::size_t idx = 0; idx < points.size(); ++idx) {
+      Track track;
+      for (ImageId id = 1; id <= 3; ++id) track.AddElement(id, idx);
+      reconstruction.AddPoint3D(points[idx] + Eigen::Vector3d(.03, -.02, .04), track);
+    }
+    GlobalBundleAdjustmentOptions options;
+    if (explicit_anchor) options.constant_image_ids.insert(1);
+    const auto summary = AdjustGlobalBundle(options, &reconstruction);
+    ASSERT_TRUE(summary.success) << summary.message;
+    ASSERT_EQ(summary.gauge_constant_translation_idxs.at(2), (std::vector<int>{1}));
+    EXPECT_EQ(summary.num_invalid_steps, 0);
+    EXPECT_LT(summary.final_mean_reprojection_error, 1e-4);
+    EXPECT_LT(summary.final_cost, summary.initial_cost);
+    EXPECT_LT((reconstruction.GetImage(1).cam_from_world->CameraCenter() - anchor).norm(), 1e-10);
+    EXPECT_NEAR(reconstruction.GetImage(2).cam_from_world->t_cw.y(), poses[1].t_cw.y(), 1e-12);
+  }
+}
+
+TEST(GlobalBundleAdjusterTest, ScaleGaugeSkipsCoincidentCameraCenters) {
+  const Camera camera = MakeCamera();
+  const auto points = MakeScenePoints();
+  const std::vector<Pose3> poses = {
+      CameraAt(Eigen::Vector3d::Zero()), CameraAt(Eigen::Vector3d::Zero()),
+      CameraAt(Eigen::Vector3d(0, 0, 1))};
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  for (std::size_t idx = 0; idx < poses.size(); ++idx) {
+    auto image = MakeRegisteredImage(idx + 1, poses[idx]);
+    AddImageObservations(camera, poses[idx], &image, points);
+    reconstruction.AddImage(image);
+  }
+  for (std::size_t idx = 0; idx < points.size(); ++idx) {
+    Track track;
+    for (ImageId id = 1; id <= 3; ++id) track.AddElement(id, idx);
+    reconstruction.AddPoint3D(points[idx] + Eigen::Vector3d(.01, -.02, .03), track);
+  }
+  const auto summary = AdjustGlobalBundle({}, &reconstruction);
+  ASSERT_TRUE(summary.success) << summary.message;
+  EXPECT_EQ(summary.gauge_constant_translation_idxs.at(3), (std::vector<int>{2}));
+  EXPECT_EQ(summary.gauge_constant_translation_idxs.count(2), 0U);
+  EXPECT_LT(summary.final_mean_reprojection_error, 1e-4);
+}
+
+TEST(GlobalBundleAdjusterTest, UnobservedImageCannotAnchorGauge) {
+  const auto camera = MakeCamera();
+  const auto points = MakeScenePoints();
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  reconstruction.AddImage(MakeRegisteredImage(1, CameraAt(Eigen::Vector3d(50, 0, 0))));
+  for (ImageId id = 2; id <= 3; ++id) {
+    const auto pose = CameraAt(Eigen::Vector3d(id - 2, 0, 0));
+    auto image = MakeRegisteredImage(id, pose);
+    AddImageObservations(camera, pose, &image, points);
+    reconstruction.AddImage(image);
+  }
+  for (std::size_t idx = 0; idx < points.size(); ++idx) {
+    Track track;
+    for (ImageId id = 2; id <= 3; ++id) track.AddElement(id, idx);
+    reconstruction.AddPoint3D(points[idx], track);
+  }
+  const auto summary = AdjustGlobalBundle({}, &reconstruction);
+  ASSERT_TRUE(summary.success) << summary.message;
+  EXPECT_EQ(summary.gauge_constant_pose_image_ids, (std::set<ImageId>{2}));
+  EXPECT_EQ(summary.gauge_constant_translation_idxs.at(3), (std::vector<int>{0}));
+  EXPECT_EQ(reconstruction.GetImage(1).cam_from_world->CameraCenter(), Eigen::Vector3d(50, 0, 0));
+}
+
+TEST(GlobalBundleAdjusterTest, FailedSolveDoesNotWriteBackParameters) {
+  const auto camera = MakeCamera();
+  const auto points = MakeScenePoints();
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  for (ImageId id = 1; id <= 2; ++id) {
+    const auto pose = CameraAt(Eigen::Vector3d(id - 1, 0, 0));
+    auto image = MakeRegisteredImage(id, pose);
+    AddImageObservations(camera, pose, &image, points);
+    reconstruction.AddImage(image);
+  }
+  for (std::size_t idx = 0; idx < points.size(); ++idx) {
+    Track track;
+    for (ImageId id = 1; id <= 2; ++id) track.AddElement(id, idx);
+    reconstruction.AddPoint3D(points[idx], track);
+  }
+  // Preserve even the original quaternion representation when evaluation
+  // fails, rather than normalizing/writing parameters from a rejected solve.
+  auto& pose = *reconstruction.GetImage(2).cam_from_world;
+  pose.q_cw.coeffs() *= 1.000001;
+  const Eigen::Vector4d before = pose.q_cw.coeffs();
+  reconstruction.GetImage(1).points2d[0].xy.x() =
+      std::numeric_limits<double>::quiet_NaN();
+  const auto summary = AdjustGlobalBundle({}, &reconstruction);
+  EXPECT_FALSE(summary.success);
+  EXPECT_NE(summary.message.find("reconstruction unchanged"), std::string::npos);
+  EXPECT_EQ(reconstruction.GetImage(2).cam_from_world->q_cw.coeffs(), before);
+}
+
 TEST(GlobalBundleAdjusterTest, RefinesNamedCameraParameterMask) {
   Camera true_camera = MakeCamera();
   true_camera.model_id = CameraModelId::kSimpleRadial;
@@ -279,6 +392,48 @@ TEST(GlobalBundleAdjusterTest, RefinesNamedCameraParameterMask) {
   EXPECT_NEAR(refined_camera.params[1], 500.0, 1e-12);
   EXPECT_NEAR(refined_camera.params[2], 400.0, 1e-12);
   EXPECT_LT(std::abs(refined_camera.params[3] - true_camera.params[3]), 0.01);
+}
+
+TEST(GlobalBundleAdjusterTest, TrackLengthFiltersObjectiveWithoutDeletingStructure) {
+  const auto camera = MakeCamera();
+  const auto points = MakeScenePoints();
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  for (ImageId id = 1; id <= 3; ++id) {
+    const auto pose = CameraAt({0.4 * (id - 1), 0, 0});
+    auto image = MakeRegisteredImage(id, pose);
+    AddImageObservations(camera, pose, &image, points);
+    reconstruction.AddImage(image);
+  }
+  Point3DId short_id = kInvalidPoint3DId;
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    Track track;
+    for (ImageId id = 1; id <= (i == 0 ? 2U : 3U); ++id) track.AddElement(id, i);
+    const auto point_id = reconstruction.AddPoint3D(points[i] + Eigen::Vector3d(0.03, 0.02, 0.04), track);
+    if (i == 0) short_id = point_id;
+  }
+  const auto short_position = reconstruction.GetPoint3D(short_id).xyz;
+  GlobalBundleAdjustmentOptions options;
+  options.refine_poses = false;
+  options.min_track_length = 3;
+  const auto result = AdjustGlobalBundle(options, &reconstruction);
+  ASSERT_TRUE(result.success) << result.message;
+  EXPECT_EQ(result.num_residuals, 3 * (points.size() - 1));
+  EXPECT_EQ(result.num_scalar_residuals, 2 * result.num_residuals);
+  EXPECT_EQ(reconstruction.Points3D().size(), points.size());
+  EXPECT_EQ(reconstruction.GetPoint3D(short_id).xyz, short_position);
+  EXPECT_LT(result.final_mean_reprojection_error, result.initial_mean_reprojection_error * 0.01);
+  std::map<Point3DId, Eigen::Vector3d> before;
+  for (const auto& [id, point] : reconstruction.Points3D()) before.emplace(id, point.xyz);
+  options.min_track_length = 4;
+  const auto empty = AdjustGlobalBundle(options, &reconstruction);
+  EXPECT_TRUE(empty.success);
+  EXPECT_EQ(empty.num_residuals, 0U);
+  for (const auto& [id, xyz] : before) EXPECT_EQ(reconstruction.GetPoint3D(id).xyz, xyz);
+  options.solver.gradient_tolerance = -1;
+  const auto invalid = AdjustGlobalBundle(options, &reconstruction);
+  EXPECT_FALSE(invalid.success);
+  for (const auto& [id, xyz] : before) EXPECT_EQ(reconstruction.GetPoint3D(id).xyz, xyz);
 }
 
 TEST(GlobalBundleAdjusterTest, SupportsEveryRegisteredCameraModel) {

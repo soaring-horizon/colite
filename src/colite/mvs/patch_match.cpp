@@ -1,4 +1,5 @@
 #include "colite/mvs/patch_match.h"
+#include "colite/mvs/patch_match_likelihood.h"
 
 #include <algorithm>
 #include <atomic>
@@ -187,6 +188,9 @@ PatchMatchCost ComputeZnccFromSamples(
   double reference_squared_mean = 0.0;
   double source_squared_mean = 0.0;
   double cross_mean = 0.0;
+  // NCC is invariant to constant offsets. Center before accumulating moments
+  // so bright, low-contrast patches do not subtract two values near one.
+  const double source_origin = source_values.front();
   for (std::size_t i = 0; i < reference_values.size(); ++i) {
     const double dx = static_cast<double>(sample_offsets[i].x());
     const double dy = static_cast<double>(sample_offsets[i].y());
@@ -199,8 +203,10 @@ PatchMatchCost ComputeZnccFromSamples(
                        color_difference * color_difference *
                            color_normalization)
             : 1.0;
-    const double reference_value = reference_values[i];
-    const double source_value = source_values[i];
+    const double reference_value =
+        static_cast<double>(reference_values[i]) - reference_center_value;
+    const double source_value =
+        static_cast<double>(source_values[i]) - source_origin;
     weight_sum += weight;
     reference_mean += weight * reference_value;
     source_mean += weight * source_value;
@@ -354,6 +360,18 @@ Eigen::Vector3f SampleNormalInHemisphere(const Eigen::Vector3f& axis,
     return normal_axis;
   }
   return sampled.normalized();
+}
+
+std::optional<float> SampleDepthNearest(const DenseDepthMap& depth_map,
+                                      float x,
+                                      float y) {
+  if (depth_map.Empty() || !std::isfinite(x) || !std::isfinite(y) ||
+      x < 0 || y < 0 || x > static_cast<float>(depth_map.Width() - 1) ||
+      y > static_cast<float>(depth_map.Height() - 1)) return std::nullopt;
+  const auto col = static_cast<std::size_t>(std::floor(x + 0.5F));
+  const auto row = static_cast<std::size_t>(std::floor(y + 0.5F));
+  const float depth = depth_map.Get(row, col);
+  return std::isfinite(depth) && depth > 0 ? std::optional<float>(depth) : std::nullopt;
 }
 
 std::optional<float> SampleDepthBilinear(const DenseDepthMap& depth_map,
@@ -627,6 +645,14 @@ struct FusionObservation {
   FusionPixelData data;
 };
 
+struct FusionSeedProjection {
+  std::uint64_t epoch = 0;
+  Eigen::Vector3d point_camera;
+  Eigen::Vector2d pixel;
+  bool depth_sampled = false;
+  std::optional<float> depth;
+};
+
 struct FusionTaskResult {
   StereoFusionResult result;
   std::vector<StereoFusionPairDiagnostics> pair_diagnostics;
@@ -636,6 +662,8 @@ struct FusionTaskResult {
   // vectors for every candidate point.
   std::vector<FusionObservation> track_scratch;
   std::vector<double> median_scratch;
+  std::uint64_t seed_epoch = 0;
+  std::vector<FusionSeedProjection> seed_projections;
   // Direct weak index avoids a linear hot-set scan and reuses views retained
   // by another worker without entering the persisted-view LRU mutex. Keep a
   // bounded strong hot set so this acceleration does not pin every dense map.
@@ -644,6 +672,18 @@ struct FusionTaskResult {
       std::pair<std::size_t,
                 std::shared_ptr<const StereoFusionViewData>>>
       view_hot_cache;
+};
+
+struct FusionViewHandle {
+  const StereoFusionViewData* data = nullptr;
+  std::shared_ptr<const StereoFusionViewData> owner;
+  FusionViewHandle() = default;
+  explicit FusionViewHandle(const StereoFusionViewData* pointer) : data(pointer) {}
+  explicit FusionViewHandle(std::shared_ptr<const StereoFusionViewData> pointer)
+      : data(pointer.get()), owner(std::move(pointer)) {}
+  explicit operator bool() const { return data != nullptr; }
+  const StereoFusionViewData* operator->() const { return data; }
+  const StereoFusionViewData& operator*() const { return *data; }
 };
 
 enum class FusionRejectReason {
@@ -842,16 +882,22 @@ std::optional<FusionPixelData> MakeFusionPixelData(
   }
 }
 
+template <typename ViewLoader>
 std::optional<FusionObservation> ProjectFusionObservationToSource(
     const std::vector<PatchMatchView>& views,
     const std::vector<FusionViewGeometry>& geometries,
-    const StereoFusionViewData& source_data,
+    const ViewLoader& load_view,
+    std::size_t source_width,
+    std::size_t source_height,
+    FusionViewHandle* loaded_source,
     const StereoFusionOptions& options,
     const FusionObservation& reference,
     std::size_t source_idx,
     const Eigen::Vector3d& reference_point_world,
     const Eigen::Vector3d& seed_point_world,
     const Eigen::Vector3d& seed_normal_world,
+    FusionSeedProjection* seed_projection,
+    std::uint64_t seed_epoch,
     std::size_t seed_image_idx,
     double min_normal_cosine,
     double min_view_cosine,
@@ -861,6 +907,7 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
   if (reject_reason != nullptr) {
     *reject_reason = FusionRejectReason::kNone;
   }
+  bool loading_source = false;
   try {
     const FusionViewGeometry& source_geometry = geometries[source_idx];
     const Eigen::Vector3d source_point_camera =
@@ -883,41 +930,58 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
                           source_point_camera.z() +
                       source_geometry.cy)
             : ProjectPoint(views[source_idx].camera, source_point_camera);
-    const Eigen::Vector3d seed_source_point_camera =
-        source_geometry.cam_from_world_rotation * seed_point_world +
-        source_geometry.cam_from_world_translation;
+    const int rounded_source_col = static_cast<int>(std::lround(source_xy.x()));
+    const int rounded_source_row = static_cast<int>(std::lround(source_xy.y()));
+    if (rounded_source_row < 0 || rounded_source_col < 0 ||
+        rounded_source_row >= static_cast<int>(source_height) ||
+        rounded_source_col >= static_cast<int>(source_width)) {
+      if (reject_reason != nullptr) *reject_reason = FusionRejectReason::kProjection;
+      return std::nullopt;
+    }
+    // In the default nearest-pixel mode a claimed pixel cannot contribute.
+    // With diagnostics/view gating disabled, reject it before preparing seed
+    // geometry and candidate storage. Detailed rejection ordering is retained
+    // when diagnostics or a view-angle gate is requested.
+    if (options.source_pixel_search_radius == 0 && error_samples == nullptr &&
+        min_view_cosine <= -1.0 + 1e-12 && source_visited != nullptr &&
+        source_visited[static_cast<std::size_t>(rounded_source_row) * source_width +
+                       rounded_source_col].load(std::memory_order_relaxed) != 0) {
+      if (reject_reason != nullptr) *reject_reason = FusionRejectReason::kVisited;
+      return std::nullopt;
+    }
+    // Every cursor in this track is checked against the same seed. Cache its
+    // projection lazily per source instead of repeating two matrix products
+    // for every cursor/source pair in a long track.
+    if (seed_projection->epoch != seed_epoch) {
+      seed_projection->depth_sampled = false;
+      seed_projection->depth.reset();
+      if (reference.traversal_depth == 0) {
+        seed_projection->point_camera = source_point_camera;
+        seed_projection->pixel = source_xy;
+      } else {
+        seed_projection->point_camera =
+            source_geometry.cam_from_world_rotation * seed_point_world +
+            source_geometry.cam_from_world_translation;
+        if (seed_projection->point_camera.z() > 0.0) {
+          seed_projection->pixel = source_geometry.pinhole
+              ? Eigen::Vector2d(
+                    source_geometry.fx * seed_projection->point_camera.x() /
+                        seed_projection->point_camera.z() + source_geometry.cx,
+                    source_geometry.fy * seed_projection->point_camera.y() /
+                        seed_projection->point_camera.z() + source_geometry.cy)
+              : ProjectPoint(views[source_idx].camera, seed_projection->point_camera);
+        }
+      }
+      seed_projection->epoch = seed_epoch;
+    }
+    const Eigen::Vector3d& seed_source_point_camera = seed_projection->point_camera;
     if (seed_source_point_camera.z() <= 0.0) {
       if (reject_reason != nullptr) {
         *reject_reason = FusionRejectReason::kProjection;
       }
       return std::nullopt;
     }
-    const Eigen::Vector2d seed_source_xy =
-        source_geometry.pinhole
-            ? Eigen::Vector2d(
-                  source_geometry.fx * seed_source_point_camera.x() /
-                          seed_source_point_camera.z() +
-                      source_geometry.cx,
-                  source_geometry.fy * seed_source_point_camera.y() /
-                          seed_source_point_camera.z() +
-                      source_geometry.cy)
-            : ProjectPoint(views[source_idx].camera,
-                           seed_source_point_camera);
-    const int rounded_source_col =
-        static_cast<int>(std::lround(source_xy.x()));
-    const int rounded_source_row =
-        static_cast<int>(std::lround(source_xy.y()));
-    if (rounded_source_row < 0 || rounded_source_col < 0 ||
-        rounded_source_row >=
-            static_cast<int>(source_data.depth_map.Height()) ||
-        rounded_source_col >=
-            static_cast<int>(source_data.depth_map.Width())) {
-      if (reject_reason != nullptr) {
-        *reject_reason = FusionRejectReason::kProjection;
-      }
-      return std::nullopt;
-    }
-
+    const Eigen::Vector2d& seed_source_xy = seed_projection->pixel;
     std::optional<double> view_cosine;
     // Preserve the original rejection/diagnostic ordering when the view-angle
     // gate is active or samples are requested. With the production default of
@@ -941,14 +1005,17 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
       }
     }
 
-    thread_local std::vector<std::pair<double, std::pair<int, int>>>
-        candidates;
-    candidates.clear();
+    using Candidate = std::pair<double, std::pair<int, int>>;
+    std::vector<Candidate>* candidates = nullptr;
     const int search_radius =
         static_cast<int>(options.source_pixel_search_radius);
     const int search_diameter = 2 * search_radius + 1;
-    candidates.reserve(static_cast<std::size_t>(search_diameter) *
-                       static_cast<std::size_t>(search_diameter));
+    if (search_radius > 0) {
+      thread_local std::vector<Candidate> neighbors;
+      candidates = &neighbors;
+      candidates->clear();
+      candidates->reserve(static_cast<std::size_t>(search_diameter) * search_diameter);
+    }
     const auto candidate_less = [](const auto& lhs, const auto& rhs) {
       if (lhs.first == rhs.first) {
         return lhs.second < rhs.second;
@@ -958,17 +1025,15 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
     const Eigen::Vector2d rounded_source_xy(
         static_cast<double>(rounded_source_col),
         static_cast<double>(rounded_source_row));
-    const double rounded_squared_distance =
-        (source_xy - rounded_source_xy).squaredNorm();
     const double fractional_col_distance =
         std::abs(source_xy.x() - rounded_source_xy.x());
     const double fractional_row_distance =
         std::abs(source_xy.y() - rounded_source_xy.y());
-    const bool has_nearest_tie =
-        std::abs(fractional_col_distance - 0.5) <= 1e-12 ||
-        std::abs(fractional_row_distance - 0.5) <= 1e-12;
-    candidates.emplace_back(
-        rounded_squared_distance,
+    const bool has_nearest_tie = search_radius > 0 &&
+        (std::abs(fractional_col_distance - 0.5) <= 1e-12 ||
+         std::abs(fractional_row_distance - 0.5) <= 1e-12);
+    if (candidates != nullptr) candidates->emplace_back(
+        (source_xy - rounded_source_xy).squaredNorm(),
         std::make_pair(rounded_source_row, rounded_source_col));
     bool remaining_candidates_generated = false;
     const auto generate_remaining_candidates = [&]() {
@@ -986,41 +1051,42 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
           const int candidate_col = rounded_source_col + col_offset;
           if (candidate_row < 0 || candidate_col < 0 ||
               candidate_row >=
-                  static_cast<int>(source_data.depth_map.Height()) ||
+                  static_cast<int>(source_height) ||
               candidate_col >=
-                  static_cast<int>(source_data.depth_map.Width())) {
+                  static_cast<int>(source_width)) {
             continue;
           }
           const Eigen::Vector2d candidate_xy(
               static_cast<double>(candidate_col),
               static_cast<double>(candidate_row));
-          candidates.emplace_back(
+          candidates->emplace_back(
               (source_xy - candidate_xy).squaredNorm(),
               std::make_pair(candidate_row, candidate_col));
         }
       }
-      std::sort(candidates.begin() + (has_nearest_tie ? 0 : 1),
-                candidates.end(), candidate_less);
+      std::sort(candidates->begin() + (has_nearest_tie ? 0 : 1),
+                candidates->end(), candidate_less);
       remaining_candidates_generated = true;
     };
     if (has_nearest_tie) {
       generate_remaining_candidates();
     }
-    bool projected_source_depth_sampled = false;
-    std::optional<float> projected_source_depth;
 
     FusionRejectReason candidate_reject_reason = FusionRejectReason::kNone;
     for (std::size_t candidate_idx = 0;; ++candidate_idx) {
-      if (candidate_idx >= candidates.size()) {
+      if (candidates == nullptr && candidate_idx != 0) break;
+      if (candidates != nullptr && candidate_idx >= candidates->size()) {
         if (remaining_candidates_generated) {
           break;
         }
         generate_remaining_candidates();
-        if (candidate_idx >= candidates.size()) {
+        if (candidate_idx >= candidates->size()) {
           break;
         }
       }
-      const auto& candidate = candidates[candidate_idx];
+      const Candidate candidate = candidates == nullptr
+          ? Candidate(0.0, {rounded_source_row, rounded_source_col})
+          : (*candidates)[candidate_idx];
       const Eigen::Vector2d candidate_xy(
           static_cast<double>(candidate.second.second),
           static_cast<double>(candidate.second.first));
@@ -1053,13 +1119,22 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
           static_cast<std::size_t>(candidate.second.second);
       if (source_visited != nullptr &&
           source_visited[
-              row * source_data.depth_map.Width() + col].load(
+              row * source_width + col].load(
                   std::memory_order_relaxed) != 0) {
         if (reject_reason != nullptr) {
           *reject_reason = FusionRejectReason::kVisited;
         }
         return std::nullopt;
       }
+      // Projection, reprojection and visited checks only need geometry and
+      // masks. Loading an evicted dense view before these checks causes cache
+      // thrashing on candidates that cannot contribute to the track.
+      if (!*loaded_source) {
+        loading_source = true;
+        *loaded_source = load_view(source_idx);
+        loading_source = false;
+      }
+      const StereoFusionViewData& source_data = **loaded_source;
       if (!source_data.depth_map.IsValid(row, col) ||
           !source_data.normal_map.IsValid(row, col) ||
           (options.require_cost_map &&
@@ -1073,14 +1148,17 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
       // 若投影落在边界或邻域深度不完整，则回退到候选离散像素深度。
       double source_depth =
           static_cast<double>(source_data.depth_map.Get(row, col));
-      if (!projected_source_depth_sampled) {
-        projected_source_depth = SampleDepthBilinear(
+      // All cursors in this track share the same seed projection and immutable
+      // source map. Cache successful samples and holes alike for this epoch;
+      // a failed sample still falls back to each candidate's own depth.
+      if (!seed_projection->depth_sampled) {
+        seed_projection->depth = SampleDepthBilinear(
             source_data.depth_map, static_cast<float>(seed_source_xy.x()),
             static_cast<float>(seed_source_xy.y()));
-        projected_source_depth_sampled = true;
+        seed_projection->depth_sampled = true;
       }
-      if (projected_source_depth.has_value()) {
-        source_depth = static_cast<double>(*projected_source_depth);
+      if (seed_projection->depth.has_value()) {
+        source_depth = static_cast<double>(*seed_projection->depth);
       }
       const double relative_depth_error =
           std::abs(seed_source_point_camera.z() - source_depth) /
@@ -1169,6 +1247,9 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
     }
     return std::nullopt;
   } catch (const std::exception&) {
+    if (loading_source) {
+      throw;
+    }
     if (reject_reason != nullptr) {
       *reject_reason = FusionRejectReason::kInvalid;
     }
@@ -1635,7 +1716,8 @@ ConsistencyGraph ReadConsistencyGraphColmapBinary(
 
 void WritePointsVisibilityColmapBinary(
     const std::filesystem::path& path,
-    const std::vector<std::vector<std::uint32_t>>& points_visibility) {
+    const std::vector<std::vector<std::uint32_t>>& points_visibility,
+    const std::vector<std::uint32_t>& image_indices) {
   std::filesystem::create_directories(path.parent_path());
   std::ofstream file(path, std::ios::binary);
   if (!file) {
@@ -1652,8 +1734,9 @@ void WritePointsVisibilityColmapBinary(
     file.write(reinterpret_cast<const char*>(&num_visible_images),
                static_cast<std::streamsize>(sizeof(num_visible_images)));
     for (const std::uint32_t image_idx : visibility) {
-      file.write(reinterpret_cast<const char*>(&image_idx),
-                 static_cast<std::streamsize>(sizeof(image_idx)));
+      const auto mapped = image_indices.empty() ? image_idx : image_indices.at(image_idx);
+      file.write(reinterpret_cast<const char*>(&mapped),
+                 static_cast<std::streamsize>(sizeof(mapped)));
     }
   }
   if (!file) {
@@ -1664,7 +1747,8 @@ void WritePointsVisibilityColmapBinary(
 
 void WritePointsVisibilityColmapBinary(
     const std::filesystem::path& path,
-    const std::vector<std::uint64_t>& points_visibility_masks) {
+    const std::vector<std::uint64_t>& points_visibility_masks,
+    const std::vector<std::uint32_t>& image_indices) {
   std::filesystem::create_directories(path.parent_path());
   std::ofstream file(path, std::ios::binary);
   if (!file) {
@@ -1685,8 +1769,9 @@ void WritePointsVisibilityColmapBinary(
                static_cast<std::streamsize>(sizeof(num_visible_images)));
     for (std::uint32_t image_idx = 0; visibility_mask != 0; ++image_idx) {
       if ((visibility_mask & 1U) != 0) {
-        file.write(reinterpret_cast<const char*>(&image_idx),
-                   static_cast<std::streamsize>(sizeof(image_idx)));
+        const auto mapped = image_indices.empty() ? image_idx : image_indices.at(image_idx);
+        file.write(reinterpret_cast<const char*>(&mapped),
+                   static_cast<std::streamsize>(sizeof(mapped)));
       }
       visibility_mask >>= 1;
     }
@@ -1818,13 +1903,7 @@ float ComputePatchMatchNccLikelihood(float cost, float ncc_sigma) {
       ncc_sigma <= 0.0F) {
     throw std::invalid_argument("Invalid PatchMatch NCC likelihood input.");
   }
-  constexpr float kPi = 3.14159265358979323846F;
-  const float normalization =
-      2.0F /
-      (std::sqrt(2.0F * kPi) * ncc_sigma *
-       std::erf(2.0F / (ncc_sigma * std::sqrt(2.0F))));
-  return std::exp(-0.5F * cost * cost / (ncc_sigma * ncc_sigma)) *
-         normalization;
+  return detail::NccLikelihood(cost, ncc_sigma);
 }
 
 PatchMatchCost ComputePatchZncc(
@@ -1960,7 +2039,7 @@ std::optional<float> ComputeSourceDepthSignedRelativeError(
     const Eigen::Vector2f source_xy =
         ProjectPoint(source_view.camera, point_source).cast<float>();
     const std::optional<float> source_depth =
-        SampleDepthBilinear(source_depth_map, source_xy.x(), source_xy.y());
+        SampleDepthNearest(source_depth_map, source_xy.x(), source_xy.y());
     if (!source_depth.has_value()) {
       return std::nullopt;
     }
@@ -2002,7 +2081,7 @@ std::optional<float> ComputeSourceDepthReprojectionError(
     const Eigen::Vector2f source_xy =
         ProjectPoint(source_view.camera, point_source).cast<float>();
     const std::optional<float> source_depth =
-        SampleDepthBilinear(source_depth_map, source_xy.x(), source_xy.y());
+        SampleDepthNearest(source_depth_map, source_xy.x(), source_xy.y());
     if (!source_depth.has_value()) return std::nullopt;
     const Eigen::Vector3d sampled_source_point =
         UnprojectPixel(source_view.camera, source_xy.cast<double>(),
@@ -2132,7 +2211,7 @@ PatchMatchCost ComputePlaneHypothesisCost(
   if (!std::isfinite(options.geometric_consistency_weight) ||
       options.geometric_consistency_weight < 0.0F ||
       !std::isfinite(options.geometric_max_reprojection_error) ||
-      options.geometric_max_reprojection_error <= 0.0F ||
+      options.geometric_max_reprojection_error < 0.0F ||
       !std::isfinite(options.geometric_max_relative_depth_error) ||
       options.geometric_max_relative_depth_error <= 0.0F) {
     throw std::invalid_argument(
@@ -2231,6 +2310,23 @@ MultiSourcePatchMatchCost ComputeMultiSourcePlaneHypothesisCost(
   if (options.robust_geometric_aggregation) {
     source_cost_options.geometric_consistency_weight = 0.0F;
   }
+  Eigen::Vector3d point_world = Eigen::Vector3d::Zero();
+  Eigen::Vector3d world_normal = Eigen::Vector3d::Zero();
+  if (options.robust_geometric_aggregation && source_depth_maps != nullptr &&
+      options.geometric_consistency_weight > 0.0F &&
+      std::isfinite(depth) && depth > 0.0F && reference_normal.allFinite()) {
+    try {
+      const Eigen::Vector3d point_camera = UnprojectPixel(
+          reference_view.camera, reference_xy.cast<double>(), depth);
+      const auto world_from_reference = reference_view.cam_from_world.Inverse();
+      point_world = world_from_reference.TransformPoint(point_camera);
+      Eigen::Vector3d normal = reference_normal.cast<double>();
+      if (normal.dot(point_camera) > 0.0) normal = -normal;
+      world_normal = world_from_reference.q_cw * normal;
+    } catch (const std::exception&) {
+      // Match invalid photometric hypotheses: no usable geometric evidence.
+    }
+  }
   for (std::size_t i = 0; i < source_views.size(); ++i) {
     const DenseDepthMap* source_depth_map =
         source_depth_maps == nullptr ? nullptr : &source_depth_maps->at(i);
@@ -2243,15 +2339,17 @@ MultiSourcePatchMatchCost ComputeMultiSourcePlaneHypothesisCost(
       valid_costs.push_back(cost.cost);
     }
     if (options.robust_geometric_aggregation && source_depth_map != nullptr &&
-        options.geometric_consistency_weight > 0.0F) {
+        options.geometric_consistency_weight > 0.0F &&
+        world_normal.dot(source_views[i].cam_from_world.CameraCenter() -
+                         point_world) > 0.0) {
       const std::optional<float> reprojection_error =
           ComputeSourceDepthReprojectionError(
               reference_view, source_views[i], reference_xy, depth,
               *source_depth_map);
-      if (reprojection_error.has_value()) {
-        geometric_errors.push_back(std::min(
-            options.geometric_max_reprojection_error, *reprojection_error));
-      }
+      geometric_errors.push_back(reprojection_error.has_value()
+          ? std::min(options.geometric_max_reprojection_error,
+                     *reprojection_error)
+          : options.geometric_max_reprojection_error);
     }
   }
 
@@ -2854,6 +2952,7 @@ PatchMatchStereoResult RunPatchMatchStereoForImageSingleScale(
     float depth_max,
     const PatchMatchStereoOptions& options,
     const PatchMatchMaps* initial_maps) {
+  ValidatePatchMatchFilterOptions(options.filter);
   if (source_views.size() != source_images.size()) {
     throw std::invalid_argument(
         "Source views and source images must have identical sizes.");
@@ -2898,6 +2997,10 @@ PatchMatchStereoResult RunPatchMatchStereoForImageSingleScale(
                                        result.depth_map, result.normal_map,
                                        options.cost, source_depth_maps);
 
+  std::vector<DenseCostMap> selection_probabilities;
+  auto selection_options = options.source_selection;
+  const bool filter_with_history = options.filter.enabled &&
+      options.source_selection.dynamic_probability && options.source_selection.directional_hmm;
   const float depth_range = depth_max - depth_min;
   float depth_radius =
       depth_range * options.initial_depth_perturbation_factor;
@@ -3018,6 +3121,18 @@ PatchMatchStereoResult RunPatchMatchStereoForImageSingleScale(
             &result.depth_map, &result.normal_map, &result.cost_map,
             perturbation, options.cost, source_depth_maps);
 
+    if (filter_with_history) {
+      if (selection_options.anneal_history) {
+        selection_options.previous_probability_weight =
+            detail::SelectionHistoryWeight(iteration, options.num_iterations);
+      }
+      result.summary.selection_history_weights.push_back(
+          selection_options.previous_probability_weight);
+      UpdatePatchMatchSelectionProbabilities(reference_view, source_views, reference_image,
+          source_images, result.depth_map, result.normal_map, options.cost,
+          selection_options, &selection_probabilities);
+    }
+
     const std::size_t iteration_candidate_evaluations =
         propagation_summary.num_candidate_evaluations +
         perturbation_summary.num_candidate_evaluations;
@@ -3085,6 +3200,19 @@ PatchMatchStereoResult RunPatchMatchStereoForImageSingleScale(
         reference_view, source_views, reference_image, source_images,
         result.depth_map, result.normal_map, options.cost, source_depth_maps);
   }
+  if (filter_with_history && options.normal_refinement.enabled) {
+    UpdatePatchMatchSelectionProbabilities(reference_view, source_views, reference_image,
+        source_images, result.depth_map, result.normal_map, options.cost,
+        selection_options, &selection_probabilities);
+  }
+  std::vector<const DenseDepthMap*> filter_depths;
+  if (source_depth_maps != nullptr) {
+    for (const auto& map : *source_depth_maps) filter_depths.push_back(&map);
+  }
+  FilterPatchMatchStereoResult(reference_view, source_views, reference_image,
+      source_images, source_depth_maps == nullptr ? nullptr : &filter_depths,
+      options.cost, options.filter, &result, selection_options,
+      selection_probabilities.empty() ? nullptr : &selection_probabilities);
   result.summary.num_valid_cost_pixels = result.cost_map.ValidPixelCount();
   return result;
 }
@@ -3201,11 +3329,13 @@ PatchMatchStereoResult RunPatchMatchStereoForImageImpl(
       level_initial_maps_ptr = &level_initial_maps;
     }
 
+    PatchMatchStereoOptions level_options = options;
+    level_options.filter.enabled = options.filter.enabled && level_idx + 1 == num_levels;
     PatchMatchStereoResult level_result =
         RunPatchMatchStereoForImageSingleScale(
             level_reference_view, level_source_views, level_reference_image,
             level_source_images, level_source_depth_maps_ptr, depth_min,
-            depth_max, options, level_initial_maps_ptr);
+            depth_max, level_options, level_initial_maps_ptr);
 
     accumulated_summary.num_iterations += level_result.summary.num_iterations;
     accumulated_summary.num_forward_sweeps +=
@@ -3246,6 +3376,10 @@ PatchMatchStereoResult RunPatchMatchStereoForImageImpl(
         level_result.summary.num_normal_refined_pixels;
     accumulated_summary.num_normal_refinement_skipped_pixels =
         level_result.summary.num_normal_refinement_skipped_pixels;
+    accumulated_summary.selection_history_weights.insert(
+        accumulated_summary.selection_history_weights.end(),
+        level_result.summary.selection_history_weights.begin(),
+        level_result.summary.selection_history_weights.end());
     accumulated_summary.update_ratios.insert(
         accumulated_summary.update_ratios.end(),
         level_result.summary.update_ratios.begin(),
@@ -3424,6 +3558,194 @@ RunPatchMatchStereoForImageWithSourceDepthPointersAndCudaWorkspace(
   return std::move(*result);
 }
 
+void UpdatePatchMatchSelectionProbabilities(
+    const PatchMatchView& reference_view,
+    const std::vector<PatchMatchView>& source_views,
+    const MvsImage& reference_image,
+    const std::vector<MvsImage>& source_images,
+    const DenseDepthMap& depth_map,
+    const NormalMap& normal_map,
+    const PatchMatchCostOptions& cost_options,
+    const PatchMatchSourceSelectionOptions& selection,
+    std::vector<DenseCostMap>* probabilities) {
+  if (probabilities == nullptr || source_views.size() != source_images.size() ||
+      !std::isfinite(selection.ncc_sigma) || selection.ncc_sigma <= 0 ||
+      !std::isfinite(selection.previous_probability_weight) ||
+      selection.previous_probability_weight < 0 || selection.previous_probability_weight > 1) {
+    throw std::invalid_argument("Invalid PatchMatch HMM inputs.");
+  }
+  RequireCompatibleFusionMaps(reference_image, depth_map, normal_map, nullptr, nullptr);
+  const std::size_t width = depth_map.Width(), height = depth_map.Height();
+  if (probabilities->empty()) {
+    probabilities->assign(source_views.size(), DenseCostMap(width, height, 0.5F));
+  }
+  if (probabilities->size() != source_views.size()) {
+    throw std::invalid_argument("HMM priors must match source views.");
+  }
+  PatchMatchCostOptions pure_cost = cost_options;
+  pure_cost.geometric_consistency_weight = 0;
+  std::vector<float> emissions(width * height);
+  std::vector<float> backward(width * height);
+  for (std::size_t source = 0; source < source_views.size(); ++source) {
+    auto& map = probabilities->at(source);
+    if (map.Width() != width || map.Height() != height || map.Data().size() != width * height) {
+      throw std::invalid_argument("Invalid HMM prior dimensions.");
+    }
+    for (const auto prior : map.Data()) {
+      if (!std::isfinite(prior) || prior < 0 || prior > 1) {
+        throw std::invalid_argument("Invalid HMM prior value.");
+      }
+    }
+    for (std::size_t row = 0; row < height; ++row) {
+      for (std::size_t col = 0; col < width; ++col) {
+        float cost = 2;
+        if (depth_map.IsValid(row, col) && normal_map.IsValid(row, col)) {
+          const auto photo = ComputePlaneHypothesisCost(reference_view, source_views[source],
+              reference_image, source_images[source], Eigen::Vector2f(col, row),
+              depth_map.Get(row, col), normal_map.Get(row, col), pure_cost, nullptr);
+          if (photo.valid) cost = 1.0F - photo.score;
+        }
+        emissions[row * width + col] = detail::NccLikelihood(cost, selection.ncc_sigma);
+      }
+    }
+    const auto scan_line = [&](std::size_t start, std::size_t stride, std::size_t size) {
+      float beta = 0.5F;
+      for (std::size_t remaining = size; remaining > 0; --remaining) {
+        const auto index = start + (remaining - 1) * stride;
+        beta = detail::HmmBackward(emissions[index], beta);
+        backward[index] = beta;
+      }
+      float alpha = 0.5F;
+      for (std::size_t offset = 0; offset < size; ++offset) {
+        const auto index = start + offset * stride;
+        alpha = detail::HmmForward(emissions[index], alpha);
+        map.MutableData()[index] = detail::HmmSelection(alpha, backward[index],
+            map.Data()[index], selection.previous_probability_weight);
+      }
+    };
+    for (std::size_t row = 0; row < height; ++row) scan_line(row * width, 1, width);
+    for (std::size_t col = 0; col < width; ++col) scan_line(col, width, height);
+  }
+}
+
+void ValidatePatchMatchFilterOptions(const PatchMatchFilterOptions& options) {
+  if (!std::isfinite(options.min_ncc) || options.min_ncc < -1.0F ||
+      options.min_ncc > 1.0F ||
+      !std::isfinite(options.min_triangulation_angle_degrees) ||
+      options.min_triangulation_angle_degrees < 0.0F ||
+      options.min_triangulation_angle_degrees > 180.0F ||
+      !std::isfinite(options.geom_consistency_max_cost) ||
+      options.geom_consistency_max_cost < 0.0F) {
+    throw std::invalid_argument("Invalid PatchMatch final filter options.");
+  }
+}
+
+void FilterPatchMatchStereoResult(
+    const PatchMatchView& reference_view,
+    const std::vector<PatchMatchView>& source_views,
+    const MvsImage& reference_image,
+    const std::vector<MvsImage>& source_images,
+    const std::vector<const DenseDepthMap*>* source_depth_maps,
+    const PatchMatchCostOptions& cost_options,
+    const PatchMatchFilterOptions& options,
+    PatchMatchStereoResult* result,
+    const PatchMatchSourceSelectionOptions& selection_options,
+    const std::vector<DenseCostMap>* probabilities) {
+  ValidatePatchMatchFilterOptions(options);
+  if (!options.enabled) return;
+  if (result == nullptr || source_views.size() != source_images.size() ||
+      (source_depth_maps != nullptr &&
+       source_depth_maps->size() != source_views.size())) {
+    throw std::invalid_argument("Invalid PatchMatch final filter inputs.");
+  }
+  RequireCompatibleFusionMaps(reference_image, result->depth_map,
+                              result->normal_map, &result->cost_map, nullptr);
+  std::vector<DenseCostMap> inferred_probabilities;
+  if (probabilities == nullptr) {
+    UpdatePatchMatchSelectionProbabilities(reference_view, source_views, reference_image,
+        source_images, result->depth_map, result->normal_map, cost_options,
+        selection_options, &inferred_probabilities);
+    probabilities = &inferred_probabilities;
+  }
+  if (probabilities->size() != source_views.size()) {
+    throw std::invalid_argument("Final filter probability maps must match sources.");
+  }
+  for (const auto& map : *probabilities) {
+    if (map.Width() != result->depth_map.Width() || map.Height() != result->depth_map.Height() ||
+        map.Data().size() != result->depth_map.NumPixels()) {
+      throw std::invalid_argument("Invalid final filter probability dimensions.");
+    }
+    for (const float probability : map.Data()) {
+      if (!std::isfinite(probability) || probability < 0 || probability > 1) {
+        throw std::invalid_argument("Invalid final filter probability value.");
+      }
+    }
+  }
+  const float min_probability = ComputePatchMatchNccLikelihood(
+      1.0F - options.min_ncc, selection_options.ncc_sigma);
+  PatchMatchCostOptions pure_cost = cost_options;
+  pure_cost.geometric_consistency_weight = 0.0F;
+  const double min_cosine = std::cos(
+      options.min_triangulation_angle_degrees * 3.14159265358979323846 / 180.0);
+  const auto world_from_reference = reference_view.cam_from_world.Inverse();
+  const Eigen::Matrix3d rotation =
+      world_from_reference.q_cw.toRotationMatrix();
+  const Eigen::Vector3d center = reference_view.cam_from_world.CameraCenter();
+  std::vector<Eigen::Vector3d> source_centers;
+  for (const auto& view : source_views) {
+    source_centers.push_back(view.cam_from_world.CameraCenter());
+  }
+  const std::size_t width = result->depth_map.Width();
+  const std::size_t height = result->depth_map.Height();
+  std::vector<std::size_t> offsets(width * height + 1, 0);
+  std::vector<ImageId> ids;
+  for (std::size_t row = 0; row < height; ++row) {
+    for (std::size_t col = 0; col < width; ++col) {
+      const std::size_t pixel = row * width + col;
+      offsets[pixel] = ids.size();
+      if (!result->depth_map.IsValid(row, col)) continue;
+      const float depth = result->depth_map.Get(row, col);
+      const Eigen::Vector2f xy(col, row);
+      const Eigen::Vector3d point_camera =
+          UnprojectPixel(reference_view.camera, xy.cast<double>(), depth);
+      const Eigen::Vector3d point_world =
+          world_from_reference.TransformPoint(point_camera);
+      Eigen::Vector3f normal = result->normal_map.Get(row, col);
+      const bool valid_normal = normal.allFinite() && normal.squaredNorm() > 0;
+      if (valid_normal && normal.cast<double>().dot(point_camera) > 0) normal = -normal;
+      const Eigen::Vector3d world_normal = rotation * normal.cast<double>();
+      for (std::size_t source = 0; valid_normal && source < source_views.size(); ++source) {
+        const Eigen::Vector3d ray = source_centers[source] - point_world;
+        if (CosineBetween(center - point_world, ray) > min_cosine ||
+            world_normal.dot(ray) <= 0.0) continue;
+        if (source_depth_maps != nullptr) {
+          const auto* map = source_depth_maps->at(source);
+          if (map == nullptr) continue;
+          const auto error = ComputeSourceDepthReprojectionError(
+              reference_view, source_views[source], xy, depth, *map);
+          if (!error || *error > options.geom_consistency_max_cost) continue;
+        }
+        const auto photo = ComputePlaneHypothesisCost(
+            reference_view, source_views[source], reference_image,
+            source_images[source], xy, depth, normal, pure_cost, nullptr);
+        if (photo.valid && probabilities->at(source).Get(row, col) >= min_probability) {
+          ids.push_back(source_views[source].image_id);
+        }
+      }
+      if (ids.size() - offsets[pixel] < options.min_num_consistent) {
+        ids.resize(offsets[pixel]);
+        result->depth_map.Set(row, col, 0.0F);
+        result->normal_map.Set(row, col, Eigen::Vector3f::Zero());
+        result->cost_map.Set(row, col, std::numeric_limits<float>::infinity());
+      }
+    }
+  }
+  offsets.back() = ids.size();
+  result->filter_graph = std::make_shared<ConsistencyGraph>(
+      ConsistencyGraph::FromCompactData(width, height, std::move(offsets), std::move(ids)));
+  result->summary.num_valid_cost_pixels = result->cost_map.ValidPixelCount();
+}
+
 PatchMatchPhotometricStats ComputePatchMatchPhotometricStats(
     const DenseCostMap& cost_map) {
   PatchMatchPhotometricStats stats;
@@ -3573,7 +3895,7 @@ ConsistencyGraph ComputeGeometricConsistencyGraph(
         if (source_depth_maps[source_idx] == nullptr) {
           continue;
         }
-        const std::optional<float> source_depth = SampleDepthBilinear(
+        const std::optional<float> source_depth = SampleDepthNearest(
             *source_depth_maps[source_idx], source_xy->x(), source_xy->y());
         if (!source_depth.has_value()) {
           continue;
@@ -3779,13 +4101,28 @@ StereoFusionResult FuseStereoDepthMapsWithViewCache(
   std::vector<std::size_t> widths(views.size());
   std::vector<std::size_t> heights(views.size());
   std::vector<std::size_t> num_pixels(views.size());
+  std::vector<std::shared_ptr<const StereoFusionViewData>> preloaded_views;
+  if (options.preload_views) {
+    preloaded_views.resize(views.size());
+    // The loader already supports concurrent requests during fusion. Load
+    // independent retained views in parallel as well; serial validation below
+    // still owns summary counters and image-id lookup construction. Keep the
+    // bounded-cache path serial so warm-up cannot evict upcoming views.
+    parallel::parallel_for_(
+        parallel::Range(0, static_cast<int>(views.size())),
+        [&](const parallel::Range& range) {
+          for (int index = range.start; index < range.end; ++index) {
+            preloaded_views[index] = load_view(index);
+          }
+        });
+  }
   // Validate in reverse order so the bounded LRU retains the first views
   // consumed by the subsequent fusion loop. Count valid depth pixels in this
   // same pass to avoid loading every persisted map a second time.
   for (std::size_t remaining = views.size(); remaining > 0; --remaining) {
     const std::size_t image_idx = remaining - 1;
     const std::shared_ptr<const StereoFusionViewData> view_data =
-        load_view(image_idx);
+        options.preload_views ? preloaded_views[image_idx] : load_view(image_idx);
     if (!view_data) {
       throw std::runtime_error("Stereo fusion view loader returned null.");
     }
@@ -3814,6 +4151,7 @@ StereoFusionResult FuseStereoDepthMapsWithViewCache(
     if (!dense_image_idx_by_id.empty()) {
       dense_image_idx_by_id[views[image_idx].image_id] = image_idx;
     }
+    if (options.preload_views) preloaded_views[image_idx] = view_data;
   }
   const auto find_image_idx =
       [&dense_image_idx_by_id, &image_idx_by_id,
@@ -3867,11 +4205,12 @@ StereoFusionResult FuseStereoDepthMapsWithViewCache(
         options.max_num_fused_observations,
         std::max<std::size_t>(options.min_num_fused_observations, 64)));
     task.view_index.resize(views.size());
+    task.seed_projections.resize(views.size());
   }
 
   for (std::size_t image_idx = 0; image_idx < views.size(); ++image_idx) {
     const std::shared_ptr<const StereoFusionViewData> reference_view_data =
-        load_view(image_idx);
+        options.preload_views ? preloaded_views[image_idx] : load_view(image_idx);
     const int height = static_cast<int>(heights[image_idx]);
     const int row_stripes = std::max(1, (height + 9) / 10);
     parallel::parallel_for_(
@@ -3884,11 +4223,14 @@ StereoFusionResult FuseStereoDepthMapsWithViewCache(
           StereoFusionResult& local = task.result;
           const auto load_task_view =
               [&](std::size_t requested_idx)
-              -> std::shared_ptr<const StereoFusionViewData> {
+              -> FusionViewHandle {
+            if (options.preload_views) {
+              return FusionViewHandle(preloaded_views[requested_idx].get());
+            }
             std::shared_ptr<const StereoFusionViewData> loaded =
                 task.view_index[requested_idx].lock();
             if (loaded) {
-              return loaded;
+              return FusionViewHandle(std::move(loaded));
             }
             loaded = load_view(requested_idx);
             task.view_index[requested_idx] = loaded;
@@ -3897,7 +4239,7 @@ StereoFusionResult FuseStereoDepthMapsWithViewCache(
               task.view_hot_cache.erase(task.view_hot_cache.begin());
             }
             task.view_hot_cache.emplace_back(requested_idx, loaded);
-            return loaded;
+            return FusionViewHandle(std::move(loaded));
           };
           for (int row_int = range.start; row_int < range.end; ++row_int) {
             const std::size_t row = static_cast<std::size_t>(row_int);
@@ -3929,6 +4271,10 @@ StereoFusionResult FuseStereoDepthMapsWithViewCache(
                 continue;
               }
               local.summary.num_visited_pixels++;
+              if (++task.seed_epoch == 0) {
+                for (auto& projection : task.seed_projections) projection.epoch = 0;
+                task.seed_epoch = 1;
+              }
 
               std::vector<FusionObservation>& track = task.track_scratch;
               track.clear();
@@ -3943,7 +4289,7 @@ StereoFusionResult FuseStereoDepthMapsWithViewCache(
                   continue;
                 }
                 const FusionPixelData& current_data = current.data;
-                const std::shared_ptr<const StereoFusionViewData>
+                const FusionViewHandle
                     current_view_data =
                         load_task_view(current.image_idx);
                 ConsistencyGraph::ImageIdRange source_image_ids;
@@ -3985,14 +4331,17 @@ StereoFusionResult FuseStereoDepthMapsWithViewCache(
                   }
 
                   FusionRejectReason reject_reason = FusionRejectReason::kNone;
-                  const std::shared_ptr<const StereoFusionViewData>
-                      source_view_data = load_task_view(source_idx);
+                  FusionViewHandle
+                      source_view_data;
                   std::optional<FusionObservation> source =
                       ProjectFusionObservationToSource(
-                          views, geometries, *source_view_data, options,
+                          views, geometries, load_task_view,
+                          widths[source_idx], heights[source_idx],
+                          &source_view_data, options,
                           current, source_idx,
                           current_data.xyz, seed_data->xyz,
                           seed_data->normal.cast<double>(),
+                          &task.seed_projections[source_idx], task.seed_epoch,
                           image_idx,
                           min_normal_cosine,
                           min_view_cosine,
@@ -4234,6 +4583,12 @@ StereoFusionResult FuseStereoDepthMapsWithViewCache(
         std::min(source.size(), kMaxMergedSamples - target->size());
     target->insert(target->end(), source.begin(), source.begin() + count);
   };
+  std::size_t total_points = 0;
+  for (const auto& task : task_results) total_points += task.result.points.size();
+  result.points.reserve(total_points);
+  result.tracks.reserve(total_points);
+  if (compact_visibility) result.points_visibility_masks.reserve(total_points);
+  else result.points_visibility.reserve(total_points);
   for (FusionTaskResult& task : task_results) {
     const std::size_t point_offset = result.points.size();
     result.points.insert(result.points.end(), task.result.points.begin(),
@@ -4294,6 +4649,9 @@ StereoFusionResult FuseStereoDepthMapsWithViewCache(
       target.num_rejected_incomplete += source.num_rejected_incomplete;
       target.num_rejected_other += source.num_rejected_other;
     }
+    // Exact aggregate reservations and releasing each consumed worker avoid
+    // overlapping growing final arrays with all per-worker output buffers.
+    task.result = StereoFusionResult();
   }
   result.summary.num_fused_points = result.points.size();
   result.pair_diagnostics.reserve(views.size() * views.size());

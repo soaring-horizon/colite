@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
 #include <vector>
 
 #include <Eigen/Core>
@@ -44,6 +45,11 @@ struct MeshTextureView {
   cv::Mat image;
 };
 
+// Decode RGB and align it to the model camera dimensions, preserving the
+// projection used by both standalone and combined surface reconstruction.
+MeshTextureView ReadMeshTextureView(const PatchMatchView& geometry,
+                                    const std::filesystem::path& image_path);
+
 struct TexturedTriangleMesh {
   DenseTriangleMesh mesh;
   // Three wedge UV coordinates per triangle, in OBJ bottom-left convention.
@@ -57,9 +63,16 @@ TexturedTriangleMesh TextureMesh(
     const std::vector<MeshTextureView>& views,
     const MeshTexturingOptions& options = {});
 
-// Writes mesh.obj, mesh.mtl, and texture.png into output_directory.
+enum class TexturedMeshOutputType { kBinary, kText };
+TexturedMeshOutputType TexturedMeshOutputTypeFromString(std::string name);
+
+// COLMAP-compatible mesh.ply (per-face UVs) and texture.png. OBJ is opt-in.
 void WriteTexturedTriangleMesh(
     const std::filesystem::path& output_directory,
-    const TexturedTriangleMesh& textured_mesh);
+    const TexturedTriangleMesh& textured_mesh,
+    TexturedMeshOutputType output_type = TexturedMeshOutputType::kBinary,
+    bool write_obj = false);
+
+TexturedTriangleMesh ReadTexturedTriangleMesh(const std::filesystem::path& mesh_path);
 
 }  // namespace colite::mvs

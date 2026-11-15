@@ -1,6 +1,7 @@
 #include "colite/matching/guided_matching.h"
 
 #include <cmath>
+#include <chrono>
 #include <limits>
 
 namespace colite {
@@ -29,6 +30,63 @@ double SquaredSampsonError(const Eigen::Matrix3d& fundamental_matrix,
 }
 
 }  // namespace
+
+bool HasGuidedMatchingModel(const TwoViewGeometry& geometry) {
+  const auto valid = [](const std::optional<Eigen::Matrix3d>& matrix) {
+    return matrix && matrix->allFinite() && matrix->cwiseAbs().maxCoeff() > 0;
+  };
+  switch (geometry.type) {
+    case TwoViewGeometry::Type::kCalibratedEssential: return valid(geometry.E);
+    case TwoViewGeometry::Type::kUncalibratedFundamental: return valid(geometry.F);
+    case TwoViewGeometry::Type::kPlanarHomography:
+    case TwoViewGeometry::Type::kPanoramic:
+    case TwoViewGeometry::Type::kPlanarOrPanoramic: return valid(geometry.H);
+    default: return false;
+  }
+}
+
+std::vector<FeatureMatch> MatchPreparedFeaturePairGuided(
+    const Camera& camera1, const FeatureSet& features1,
+    const PreparedFeatureMatcher& prepared1,
+    const Camera& camera2, const FeatureSet& features2,
+    const PreparedFeatureMatcher& prepared2,
+    const TwoViewGeometry& geometry, const double max_error_px,
+    const DescriptorMatchingOptions& options, GuidedDescriptorMatchingStats* stats) {
+  if (!HasGuidedMatchingModel(geometry) || !std::isfinite(max_error_px) || max_error_px < 0) return {};
+  if (geometry.type == TwoViewGeometry::Type::kUncalibratedFundamental) {
+    return MatchPreparedFeatureSetsGuidedFundamental(prepared1, prepared2, *geometry.F,
+                                                    max_error_px, options, stats);
+  }
+  const auto started = std::chrono::steady_clock::now();
+  const bool calibrated = geometry.type == TwoViewGeometry::Type::kCalibratedEssential;
+  const auto coordinates = [calibrated](const Camera& camera, const FeatureSet& features) {
+    std::vector<Eigen::Vector2d> result;
+    result.reserve(features.keypoints.size());
+    for (const auto& point : features.keypoints) {
+      const Eigen::Vector2d pixel(point.x, point.y);
+      if (!calibrated) {
+        result.push_back(pixel);
+      } else {
+        const auto ray = TryUnprojectPixel(camera, pixel, 1.0);
+        result.push_back(ray ? Eigen::Vector2d(ray->x() / ray->z(), ray->y() / ray->z())
+                             : Eigen::Vector2d::Constant(std::numeric_limits<double>::quiet_NaN()));
+      }
+    }
+    return result;
+  };
+  const auto points1 = coordinates(camera1, features1);
+  const auto points2 = coordinates(camera2, features2);
+  double threshold = max_error_px;
+  if (calibrated) {
+    const double first = max_error_px / camera1.MeanFocalLength();
+    const double second = max_error_px / camera2.MeanFocalLength();
+    threshold = std::sqrt(0.5 * (first * first + second * second));
+  }
+  if (stats) stats->candidate_generation_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  return MatchPreparedFeatureSetsGuidedGeometry(prepared1, prepared2,
+      calibrated ? GuidedGeometryType::kEpipolar : GuidedGeometryType::kHomography,
+      calibrated ? *geometry.E : *geometry.H, points1, points2, threshold, options, stats);
+}
 
 std::vector<FeatureMatch> FilterMatchesByGuidedFundamental(
     const FeatureSet& features1,

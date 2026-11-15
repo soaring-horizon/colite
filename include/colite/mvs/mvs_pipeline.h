@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 #include "colite/core/reconstruction.h"
@@ -77,6 +78,12 @@ std::vector<SourceImageScore> SelectSourceImages(
 
 SparseDepthMap BuildSparseDepthMap(const Reconstruction& reconstruction,
                                    ImageId image_id);
+
+// Fusion ranks shared tracks without PatchMatch angle/scale diagnostics.
+// Build all image-pair counts once instead of rescanning every point per view.
+std::unordered_map<ImageId, std::vector<ImageId>> ComputeOverlappingImages(
+    const Reconstruction& reconstruction, std::size_t max_num_images,
+    std::size_t min_num_shared_points = 1);
 
 MvsPipelineSummary RunMvsPipeline(
     const Reconstruction& reconstruction,

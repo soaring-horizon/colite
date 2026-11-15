@@ -1,0 +1,26 @@
+{
+  "camera_pose.h": {
+    "url": "https://raw.githubusercontent.com/PoseLib/PoseLib/v2.0.4/PoseLib/camera_pose.h",
+    "sha256": "f0715fe654d513fa67e890fc1c0a7ee967fd4327dcf26228469a011f29b221b6"
+  },
+  "LICENSE": {
+    "url": "https://raw.githubusercontent.com/PoseLib/PoseLib/v2.0.4/LICENSE",
+    "sha256": "f956d2d12c3a58c72e936bb390071d4c4df8f4da008bdcd617bb0a8a890eda1c"
+  },
+  "p3p.cc": {
+    "url": "https://raw.githubusercontent.com/PoseLib/PoseLib/v2.0.4/PoseLib/solvers/p3p.cc",
+    "sha256": "98a37dfaa4bd7af9808b5c82b58c27a00004b0af93082286216550e0d264bb45"
+  },
+  "p3p.h": {
+    "url": "https://raw.githubusercontent.com/PoseLib/PoseLib/v2.0.4/PoseLib/solvers/p3p.h",
+    "sha256": "4f47fdc260e7aacf48799a611cc62cd13b198931b73ab4133ea8aa12dbd675c4"
+  },
+  "p3p_common.h": {
+    "url": "https://raw.githubusercontent.com/PoseLib/PoseLib/v2.0.4/PoseLib/solvers/p3p_common.h",
+    "sha256": "d58d5fff335b21a383a5e7d4b3e6b5560d979dc2402b08b8ea9515d98c1547ec"
+  },
+  "quaternion.h": {
+    "url": "https://raw.githubusercontent.com/PoseLib/PoseLib/v2.0.4/PoseLib/misc/quaternion.h",
+    "sha256": "09ea69c607d16f47d348d96e055da6d4df9dd81c4b748d07c9ddfa19b6fea8fa"
+  }
+}

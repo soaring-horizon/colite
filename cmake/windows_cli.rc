@@ -1,0 +1,37 @@
+#include <windows.h>
+#include "colite_release.h"
+
+#ifndef COLITE_EXE_NAME
+#define COLITE_EXE_NAME "colite"
+#endif
+#ifndef COLITE_EXE_FILENAME
+#define COLITE_EXE_FILENAME "colite.exe"
+#endif
+
+IDI_ICON1 ICON "../gui/assets/colite.ico"
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION COLITE_VERSION_RESOURCE
+ PRODUCTVERSION COLITE_VERSION_RESOURCE
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Colite reconstruction engine\0"
+      VALUE "FileVersion", COLITE_RELEASE_VERSION
+      VALUE "InternalName", COLITE_EXE_NAME
+      VALUE "OriginalFilename", COLITE_EXE_FILENAME
+      VALUE "ProductName", "Colite\0"
+      VALUE "ProductVersion", COLITE_RELEASE_VERSION
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END

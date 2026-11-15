@@ -27,6 +27,15 @@ SimilarityTransform3 EstimateSimilarityTransform(
 void TransformReconstruction(const SimilarityTransform3& transform,
                              Reconstruction* reconstruction);
 
+// Center registered cameras using coordinate-wise trimmed means and scale
+// their trimmed bounding-box diagonal to extent, as in COLMAP Normalize.
+// Fewer than two registered cameras are an identity/no-op. Position priors
+// remain in their target coordinate system.
+SimilarityTransform3 NormalizeReconstruction(
+    Reconstruction* reconstruction, bool fixed_scale = false,
+    double extent = 10.0, double min_percentile = 0.1,
+    double max_percentile = 0.9);
+
 struct PositionPriorAlignmentSummary {
   bool success = false;
   std::size_t num_priors = 0;

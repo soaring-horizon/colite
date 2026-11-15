@@ -19,6 +19,10 @@
 
 namespace colite::mvs {
 
+// Shared by standalone stages and the controller's photometric ownership key.
+inline constexpr const char* kPatchMatchImplementationVersion =
+    "patch_match_v21_selection_history_annealing";
+
 class CudaPatchMatchWorkspace;
 
 struct PatchMatchInitializationOptions {
@@ -54,12 +58,15 @@ struct PatchMatchCostOptions {
   // 双边权重的灰度标准差，输入灰度范围为 [0, 1]。
   float sigma_color = 0.2F;
   float invalid_cost = 1.0F;
-  float min_variance = 1e-8F;
+  // Match COLMAP's normalized-grayscale NCC variance floor.
+  float min_variance = 1e-5F;
   // 几何一致性软约束权重。为 0 时保持纯光度 PatchMatch 行为。
   float geometric_consistency_weight = 0.0F;
   // Decouple the geometric term from photometric source ranking and use a
-  // robust lower-half consensus across valid source depth maps. This avoids
-  // a single photometrically lucky source dominating weak-texture regions.
+  // robust lower-half consensus across source depth maps whose cameras
+  // face the candidate surface (normal oriented toward the reference camera).
+  // Missing depth receives the maximum penalty before lower-half aggregation.
+  // This avoids a single photometrically lucky source dominating weak texture.
   bool robust_geometric_aggregation = true;
   // Truncation in pixels for the COLMAP-style forward-backward geometric
   // reprojection cost used during the second PatchMatch pass.
@@ -169,8 +176,19 @@ struct PatchMatchSourceSelectionOptions {
   std::size_t num_samples = 0;
   float ncc_sigma = 0.6F;
   float previous_probability_weight = 0.5F;
+  // Stereo search may anneal the history weight over its inference updates.
+  // Individual probability-inference calls use previous_probability_weight.
+  bool anneal_history = false;
   float min_probability = 0.05F;
   float max_probability = 0.999F;
+};
+
+struct PatchMatchFilterOptions {
+  bool enabled = false;
+  float min_ncc = 0.1F;
+  float min_triangulation_angle_degrees = 3.0F;
+  std::size_t min_num_consistent = 2;
+  float geom_consistency_max_cost = 1.0F;
 };
 
 struct PatchMatchStereoOptions {
@@ -178,6 +196,7 @@ struct PatchMatchStereoOptions {
   int cuda_gpu_index = -1;
   PatchMatchInitializationOptions initialization;
   PatchMatchCostOptions cost;
+  PatchMatchFilterOptions filter;
   PatchMatchPerturbationOptions perturbation;
   PatchMatchSourceSelectionOptions source_selection;
   PatchMatchPropagationSchedule propagation_schedule =
@@ -286,12 +305,18 @@ struct PatchMatchStereoSummary {
   std::vector<std::size_t> iteration_source_selection_rejections;
   std::vector<float> iteration_source_selection_probability_means;
   std::vector<float> final_source_selection_probability_means;
+  std::vector<float> selection_history_weights;
 };
+
+class ConsistencyGraph;
 
 struct PatchMatchStereoResult {
   DenseDepthMap depth_map;
   NormalMap normal_map;
   DenseCostMap cost_map;
+  // Only final-scale filtering produces this graph. Each edge satisfies all
+  // enabled conditions in the same source; optimization costs stay separate.
+  std::shared_ptr<const ConsistencyGraph> filter_graph;
   PatchMatchStereoSummary summary;
 };
 
@@ -441,6 +466,9 @@ struct StereoFusionOptions {
   // Persisted Fusion with at most 64 views can avoid one heap allocation per
   // point by retaining visibility as a bit mask until binary serialization.
   bool compact_visibility = false;
+  // Pin validated views once. Hot pixel traversals can then borrow pointers
+  // without repeatedly contending on shared/weak reference counters.
+  bool preload_views = false;
 };
 
 struct StereoFusionSummary {
@@ -701,6 +729,29 @@ RunPatchMatchStereoForImageWithSourceDepthPointersAndCudaWorkspace(
 PatchMatchPhotometricStats ComputePatchMatchPhotometricStats(
     const DenseCostMap& cost_map);
 
+void ValidatePatchMatchFilterOptions(const PatchMatchFilterOptions& options);
+void UpdatePatchMatchSelectionProbabilities(
+    const PatchMatchView& reference_view,
+    const std::vector<PatchMatchView>& source_views,
+    const MvsImage& reference_image,
+    const std::vector<MvsImage>& source_images,
+    const DenseDepthMap& depth_map,
+    const NormalMap& normal_map,
+    const PatchMatchCostOptions& cost_options,
+    const PatchMatchSourceSelectionOptions& selection_options,
+    std::vector<DenseCostMap>* probabilities);
+void FilterPatchMatchStereoResult(
+    const PatchMatchView& reference_view,
+    const std::vector<PatchMatchView>& source_views,
+    const MvsImage& reference_image,
+    const std::vector<MvsImage>& source_images,
+    const std::vector<const DenseDepthMap*>* source_depth_maps,
+    const PatchMatchCostOptions& cost_options,
+    const PatchMatchFilterOptions& filter_options,
+    PatchMatchStereoResult* result,
+    const PatchMatchSourceSelectionOptions& selection_options = {},
+    const std::vector<DenseCostMap>* probabilities = nullptr);
+
 PatchMatchPhotometricFilterSummary FilterPatchMatchPhotometricResults(
     float max_cost,
     DenseDepthMap* depth_map,
@@ -732,10 +783,12 @@ ConsistencyGraph ReadConsistencyGraphColmapBinary(
     const std::vector<ImageId>& image_ids_by_index);
 void WritePointsVisibilityColmapBinary(
     const std::filesystem::path& path,
-    const std::vector<std::vector<std::uint32_t>>& points_visibility);
+    const std::vector<std::vector<std::uint32_t>>& points_visibility,
+    const std::vector<std::uint32_t>& image_indices = {});
 void WritePointsVisibilityColmapBinary(
     const std::filesystem::path& path,
-    const std::vector<std::uint64_t>& points_visibility_masks);
+    const std::vector<std::uint64_t>& points_visibility_masks,
+    const std::vector<std::uint32_t>& image_indices = {});
 std::vector<std::vector<std::uint32_t>> ReadPointsVisibilityColmapBinary(
     const std::filesystem::path& path);
 

@@ -43,15 +43,27 @@ std::vector<ImagePair> GenerateExhaustivePairs(
 
 std::vector<ImagePair> GenerateSequentialPairs(
     const std::vector<Image>& images,
-    const std::size_t overlap) {
+    const std::size_t overlap,
+    const bool quadratic = false) {
   if (overlap == 0) {
     throw std::invalid_argument("sequential overlap must be positive");
   }
   std::set<ImagePair> pairs;
   for (std::size_t i = 0; i < images.size(); ++i) {
-    const std::size_t end = std::min(images.size(), i + overlap + 1);
-    for (std::size_t j = i + 1; j < end; ++j) {
-      AddPair(images[i].id, images[j].id, &pairs);
+    const std::size_t remaining = images.size() - i - 1;
+    if (quadratic) {
+      const std::size_t levels = std::min<std::size_t>(
+          overlap, std::numeric_limits<std::size_t>::digits);
+      for (std::size_t level = 0; level < levels; ++level) {
+        const std::size_t offset = std::size_t{1} << level;
+        if (offset > remaining) break;
+        AddPair(images[i].id, images[i + offset].id, &pairs);
+      }
+    } else {
+      const std::size_t end = i + std::min(overlap, remaining) + 1;
+      for (std::size_t j = i + 1; j < end; ++j) {
+        AddPair(images[i].id, images[j].id, &pairs);
+      }
     }
   }
   return ToVector(pairs);
@@ -98,6 +110,69 @@ std::vector<ImagePair> GenerateSpatialPairs(
     }
   }
   return ToVector(pairs);
+}
+
+std::vector<ImagePair> GenerateTransitivePairs(
+    const std::vector<Image>& images,
+    const MatchGraph& graph,
+    const std::size_t max_path_length,
+    const std::size_t max_num_neighbors) {
+  if (max_path_length < 2 || max_num_neighbors == 0) {
+    throw std::invalid_argument(
+        "transitive matching requires path length >= 2 and neighbors > 0");
+  }
+  std::map<ImageId, std::set<ImageId>> adjacency;
+  for (const Image& image : images) {
+    adjacency[image.id];
+  }
+  for (const auto& [pair, geometry] : graph.verified_geometries) {
+    if (geometry.inlier_matches.empty()) {
+      continue;
+    }
+    adjacency[pair.image_id1].insert(pair.image_id2);
+    adjacency[pair.image_id2].insert(pair.image_id1);
+  }
+  std::set<ImagePair> candidates;
+  for (const Image& source_image : images) {
+    const ImageId source = source_image.id;
+    std::map<ImageId, std::size_t> distance{{source, 0}};
+    std::vector<ImageId> frontier{source};
+    for (std::size_t depth = 1;
+         depth <= max_path_length && !frontier.empty(); ++depth) {
+      std::vector<ImageId> next;
+      for (const ImageId current : frontier) {
+        for (const ImageId neighbor : adjacency[current]) {
+          if (distance.emplace(neighbor, depth).second) {
+            next.push_back(neighbor);
+          }
+        }
+      }
+      frontier = std::move(next);
+    }
+    std::vector<std::pair<std::size_t, ImageId>> ranked;
+    for (const auto& [target, path_length] : distance) {
+      if (path_length < 2 || target == source ||
+          graph.verified_geometries.count(ImagePair::Ordered(source, target)) > 0 ||
+          graph.matches.count(ImagePair::Ordered(source, target)) > 0) {
+        continue;
+      }
+      std::size_t common_neighbors = 0;
+      for (const ImageId neighbor : adjacency[source]) {
+        common_neighbors += adjacency[target].count(neighbor) > 0 ? 1 : 0;
+      }
+      ranked.emplace_back(common_neighbors, target);
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) {
+      return lhs.first != rhs.first ? lhs.first > rhs.first
+                                    : lhs.second < rhs.second;
+    });
+    ranked.resize(std::min(max_num_neighbors, ranked.size()));
+    for (const auto& [support, target] : ranked) {
+      (void)support;
+      AddPair(source, target, &candidates);
+    }
+  }
+  return ToVector(candidates);
 }
 
 using DescriptorVector = std::vector<float>;
@@ -450,13 +525,15 @@ std::vector<ImagePair> GenerateMatchingPairs(
     case MatchingStrategy::kExhaustive:
       return GenerateExhaustivePairs(images);
     case MatchingStrategy::kSequential:
-      return GenerateSequentialPairs(images, options.sequential_overlap);
+      return GenerateSequentialPairs(images, options.sequential_overlap,
+                                     options.sequential_quadratic_overlap);
     case MatchingStrategy::kSpatial:
       return GenerateSpatialPairs(images, options.spatial_max_num_neighbors,
                                   options.spatial_max_distance);
     case MatchingStrategy::kVocabTree:
+    case MatchingStrategy::kTransitive:
       throw std::invalid_argument(
-          "vocab tree matching requires a MatchGraph with features");
+          "this matching strategy requires a MatchGraph");
   }
   throw std::invalid_argument("unsupported matching strategy");
 }
@@ -475,6 +552,10 @@ std::vector<ImagePair> GenerateMatchingPairs(
         options.vocab_tree_max_num_features,
         options.vocab_tree_sequential_overlap, options.vocab_tree_path,
         summary);
+  } else if (options.strategy == MatchingStrategy::kTransitive) {
+    pairs = GenerateTransitivePairs(
+        images, graph, options.transitive_max_path_length,
+        options.transitive_max_num_neighbors);
   } else {
     pairs = GenerateMatchingPairs(images, options);
   }

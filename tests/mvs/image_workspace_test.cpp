@@ -1,6 +1,7 @@
 #include "colite/mvs/image_workspace.h"
 
 #include <filesystem>
+#include <future>
 
 #include <gtest/gtest.h>
 #include <opencv2/imgcodecs.hpp>
@@ -138,6 +139,32 @@ TEST(MvsImageWorkspaceTest, EvictsLeastRecentlyUsedImage) {
   EXPECT_EQ(workspace.NumCachedImages(), 1U);
 }
 
+TEST(MvsImageWorkspaceTest, ConcurrentReadsDoNotMutateOrPopulateLru) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    "colite_mvs_independent_reads_test";
+  std::filesystem::create_directories(root);
+  WriteGrayImage(root / "image1.png", 128);
+  WriteGrayImage(root / "image2.png", 32);
+  MvsImageWorkspaceOptions options;
+  options.image_path = root;
+  options.max_cache_entries = 1;
+  const MvsImageWorkspace workspace(MakeWorkspaceReconstruction(), options);
+  std::vector<std::future<MvsImage>> reads;
+  for (int i = 0; i < 16; ++i) {
+    reads.push_back(std::async(std::launch::async, [&workspace, i] {
+      return workspace.ReadImage(1 + i % 2);
+    }));
+  }
+  for (int i = 0; i < 16; ++i) {
+    const MvsImage image = reads[i].get();
+    EXPECT_EQ(image.image_id, 1U + i % 2);
+    EXPECT_NEAR(image.gray.at<float>(0, 0),
+                (i % 2 == 0 ? 128.0F : 32.0F) / 255.0F, 1e-6F);
+  }
+  EXPECT_EQ(workspace.NumCachedImages(), 0U);
+  std::filesystem::remove_all(root);
+}
+
 TEST(MvsImageWorkspaceTest, DownsizesLoadedImageByMaxDimension) {
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() / "colite_mvs_workspace_resize_test";
@@ -156,6 +183,24 @@ TEST(MvsImageWorkspaceTest, DownsizesLoadedImageByMaxDimension) {
   EXPECT_EQ(image.Width(), 2U);
   EXPECT_EQ(image.Height(), 1U);
   EXPECT_DOUBLE_EQ(image.scale, 0.5);
+}
+
+TEST(MvsImageWorkspaceTest, UsesModelScaleForAlreadyResizedColmapBitmaps) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    "colite_mvs_resized_colmap_test";
+  std::filesystem::create_directories(root);
+  // Model cameras are 4x2, while bitmaps have already been resized to 2x1.
+  cv::imwrite((root / "image1.png").string(),
+              cv::Mat(1, 2, CV_8UC1, cv::Scalar(128)));
+  MvsImageWorkspaceOptions options;
+  options.image_path = root;
+  options.max_image_size = 2;
+  MvsImageWorkspace workspace(MakeWorkspaceReconstruction(), options);
+  const auto image = workspace.ReadImage(1);
+  EXPECT_EQ(image.Width(), 2U);
+  EXPECT_EQ(image.Height(), 1U);
+  EXPECT_DOUBLE_EQ(image.scale, 0.5);
+  std::filesystem::remove_all(root);
 }
 
 TEST(MvsImageWorkspaceTest, DownsizesLoadedImageByResolutionLevel) {

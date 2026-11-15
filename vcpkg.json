@@ -1,0 +1,22 @@
+{
+  "name": "colite",
+  "version": "0.2.0",
+  "builtin-baseline": "c653b77e80d1b61e5f5bd2eabf15bc6ec3bfe7ad",
+  "dependencies": [
+    "eigen3",
+    { "name": "ceres", "default-features": false, "features": ["eigensparse", "schur"] },
+    { "name": "opencv4", "default-features": false, "features": ["jpeg", "png"] },
+    "glog",
+    "flann",
+    "lz4"
+  ],
+  "features": {
+    "tests": { "description": "Native contract and algorithm tests", "dependencies": ["gtest"] },
+    "delaunay": { "description": "Optional CGAL Delaunay mesher", "dependencies": ["cgal"] }
+  },
+  "overrides": [
+    { "name": "ceres", "version": "2.2.0", "port-version": 5 },
+    { "name": "eigen3", "version": "3.4.0" },
+    { "name": "opencv4", "version": "4.12.0" }
+  ]
+}

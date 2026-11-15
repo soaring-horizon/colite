@@ -204,6 +204,33 @@ TEST(SfmCameraSetupTest, AppliesExplicitModelParameters) {
   EXPECT_TRUE(setup.cameras[0].has_prior_focal_length);
 }
 
+TEST(SfmCameraSetupTest, SymlinkedImagesPreserveLogicalNamesAndFolderGroups) {
+  const auto root = std::filesystem::temp_directory_path() / "colite_symlink_camera_names";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root / "images/a");
+  std::filesystem::create_directories(root / "images/b");
+  const auto target = root / "external.png";
+  ASSERT_TRUE(cv::imwrite(target.string(), cv::Mat(16, 16, CV_8UC1, cv::Scalar(128))));
+  const auto a = root / "images/a/view.png", b = root / "images/b/view.png";
+  std::error_code error;
+  std::filesystem::create_symlink(target, a, error);
+  if (error) {
+    std::filesystem::remove_all(root);
+    GTEST_SKIP() << "Symlinks unavailable: " << error.message();
+  }
+  std::filesystem::create_symlink(target, b);
+  SfmCameraSetupOptions options;
+  options.image_root = root / "images";
+  options.sharing_mode = CameraSharingMode::kPerFolder;
+  const auto setup = BuildSfmCameraSetup({a, b}, options);
+  ASSERT_EQ(setup.images.size(), 2U);
+  EXPECT_EQ(setup.images[0].name, "a/view.png");
+  EXPECT_EQ(setup.images[1].name, "b/view.png");
+  EXPECT_EQ(setup.cameras.size(), 2U);
+  EXPECT_NE(setup.images[0].camera_id, setup.images[1].camera_id);
+  std::filesystem::remove_all(root);
+}
+
 TEST(SfmCameraSetupTest, ConvertsGeodeticCoordinatesToLocalEnu) {
   const GeodeticCoordinate origin{46.65, 6.53, 780.0};
   const GeodeticCoordinate east{46.65, 6.531, 780.0};

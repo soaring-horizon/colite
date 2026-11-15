@@ -1,7 +1,10 @@
 #pragma once
 
 #include <cstddef>
+#include <iterator>
+#include <limits>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -16,30 +19,60 @@ namespace colite {
 struct IncrementalTriangulatorCache {
   using ObservationKey = std::pair<ImageId, Point2DIdx>;
   struct CorrespondenceAdjacency {
-    using Neighbors = std::vector<ObservationKey>;
+    // One immutable CSR graph is shared by local triangulation and global
+    // completion. Edges store dense observation indices, in input order.
+    struct Neighbors {
+      struct Iterator {
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = ObservationKey;
+        using difference_type = std::ptrdiff_t;
+        using pointer = const ObservationKey*;
+        using reference = const ObservationKey&;
+        const CorrespondenceAdjacency* graph = nullptr;
+        std::size_t position = 0;
+        reference operator*() const {
+          return graph->observations[graph->edges[position]];
+        }
+        pointer operator->() const { return &operator*(); }
+        Iterator& operator++() { ++position; return *this; }
+        Iterator operator++(int) { auto previous = *this; ++*this; return previous; }
+        bool operator==(const Iterator& other) const {
+          return graph == other.graph && position == other.position;
+        }
+        bool operator!=(const Iterator& other) const { return !(*this == other); }
+      };
+      const CorrespondenceAdjacency* graph;
+      std::size_t first, last;
+      Iterator begin() const { return {graph, first}; }
+      Iterator end() const { return {graph, last}; }
+      std::size_t size() const { return last - first; }
+      bool empty() const { return first == last; }
+      const ObservationKey& front() const { return *begin(); }
+    };
 
-    void ResizeImage(ImageId image_id, std::size_t num_points2d) {
-      by_image[image_id].resize(num_points2d);
-    }
-
-    Neighbors* Mutable(const ObservationKey& observation) {
-      auto& image = by_image[observation.first];
-      if (observation.second >= image.size()) {
-        image.resize(observation.second + 1);
-      }
-      return &image[observation.second];
-    }
-
-    const Neighbors* Find(const ObservationKey& observation) const {
+    std::size_t Index(const ObservationKey& observation) const {
       const auto image_it = by_image.find(observation.first);
       if (image_it == by_image.end() ||
-          observation.second >= image_it->second.size()) {
-        return nullptr;
+          observation.second >= image_it->second.second) {
+        return std::numeric_limits<std::size_t>::max();
       }
-      return &image_it->second[observation.second];
+      return image_it->second.first + observation.second;
     }
-
-    std::map<ImageId, std::vector<Neighbors>> by_image;
+    std::optional<Neighbors> Find(const ObservationKey& observation) const {
+      const auto index = Index(observation);
+      if (index == std::numeric_limits<std::size_t>::max()) return std::nullopt;
+      return Neighbors{this, edge_offsets[index], edge_offsets[index + 1]};
+    }
+    bool IsTwoViewObservation(const ObservationKey& observation) const {
+      const auto neighbors = Find(observation);
+      if (!neighbors || neighbors->size() != 1) return false;
+      const auto other_neighbors = Find(neighbors->front());
+      return other_neighbors && other_neighbors->size() == 1;
+    }
+    // image -> (first dense observation index, number of feature rows).
+    std::map<ImageId, std::pair<std::size_t, std::size_t>> by_image;
+    std::vector<ObservationKey> observations;
+    std::vector<std::size_t> edge_offsets, edges;
   };
 
   explicit IncrementalTriangulatorCache(const MatchGraph& graph);
@@ -60,7 +93,8 @@ struct IncrementalTriangulatorOptions {
   double continue_max_angle_error_deg = 2.0;
   double merge_max_reprojection_error_px = 4.0;
   double complete_max_reprojection_error_px = 4.0;
-  std::size_t complete_max_transitivity = 6;
+  // Zero disables correspondence propagation; merging remains independent.
+  std::size_t complete_max_transitivity = 5;
   // Final-pose descriptor-guided completion. These conservative defaults
   // require a target feature to agree with at least two existing track
   // descriptors and to lie within two pixels of the projected 3D point.

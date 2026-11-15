@@ -71,6 +71,12 @@ public:
     void setUseAvx2(bool enabled) { useAvx2 = enabled; }
     bool getUseAvx2() const { return useAvx2; }
     SiftProfile getLastProfile() const { return lastProfile; }
+    void setGeometryLimits(int first, int maximumOctaves, int maximumOrientations) {
+        firstOctaveIndex = first;
+        maxOctaveCount = maximumOctaves;
+        maxOrientationCount = maximumOrientations;
+    }
+
 
 private:
     Sift() = default;
@@ -82,6 +88,9 @@ private:
     double sigma = 1.6;
     bool enablePreciseUpscale = false;
     bool useAvx2 = false;
+    int firstOctaveIndex = -1;
+    int maxOctaveCount = -1;
+    int maxOrientationCount = 0; // Unlimited for the original low-level API.
     SiftProfile lastProfile;
 };
 

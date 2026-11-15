@@ -1,4 +1,5 @@
 #include "colite/controllers/sfm_camera_setup.h"
+#include "colite/io/image_reader.h"
 
 #include <algorithm>
 #include <cmath>
@@ -26,13 +27,13 @@ struct ImageMetadata {
 
 ImageMetadata ReadImageMetadata(const std::filesystem::path& image_path,
                                 const SfmCameraSetupOptions& options) {
-  const cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_COLOR);
-  if (image.empty()) {
+  const cv::Size image_size = ReadImageSizeWithExifOrientation(image_path);
+  if (image_size.empty()) {
     throw std::runtime_error("Failed to read image: " + image_path.string());
   }
   ImageMetadata metadata;
-  metadata.width = static_cast<std::uint32_t>(image.cols);
-  metadata.height = static_cast<std::uint32_t>(image.rows);
+  metadata.width = static_cast<std::uint32_t>(image_size.width);
+  metadata.height = static_cast<std::uint32_t>(image_size.height);
   metadata.focal = EstimateInitialFocalLengthPriorFromImage(
       image_path, options.focal_length, options.default_focal_length_factor);
   metadata.exif = ReadExifCameraMetadata(image_path);
@@ -63,10 +64,10 @@ std::filesystem::path CommonImageRoot(
 
 std::string RelativeImageName(const std::filesystem::path& image_path,
                               const std::filesystem::path& image_root) {
-  std::error_code error;
   const std::filesystem::path relative =
-      std::filesystem::relative(image_path, image_root, error);
-  if (error || relative.empty() ||
+      std::filesystem::absolute(image_path).lexically_normal().lexically_relative(
+          std::filesystem::absolute(image_root).lexically_normal());
+  if (relative.empty() ||
       (!relative.empty() && *relative.begin() == "..")) {
     return image_path.filename().generic_string();
   }

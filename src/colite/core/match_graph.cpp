@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <stdexcept>
 
+#include <Eigen/LU>
+
 namespace colite {
 namespace {
 
@@ -23,9 +25,7 @@ std::vector<FeatureMatch> ReorderMatchesIfNeeded(
 }
 
 bool IsUsableVerifiedGeometry(const TwoViewGeometry& geometry) {
-  return geometry.type != TwoViewGeometry::Type::kUndefined &&
-         geometry.type != TwoViewGeometry::Type::kDegenerate &&
-         !geometry.inlier_matches.empty();
+  return geometry.HasUsableCorrespondences();
 }
 
 }  // namespace
@@ -60,6 +60,20 @@ void SetMatches(MatchGraph* graph,
   graph->matches[pair] = ReorderMatchesIfNeeded(image_id1, image_id2, matches);
 }
 
+TwoViewGeometry ReverseTwoViewGeometry(const TwoViewGeometry& geometry) {
+  TwoViewGeometry reversed = geometry;
+  if (reversed.F) reversed.F = reversed.F->transpose().eval();
+  if (reversed.E) reversed.E = reversed.E->transpose().eval();
+  if (reversed.H) {
+    if (!reversed.H->fullPivLu().isInvertible())
+      throw std::invalid_argument("Cannot reverse a singular homography");
+    reversed.H = reversed.H->inverse().eval();
+  }
+  if (reversed.cam2_from_cam1) reversed.cam2_from_cam1 = reversed.cam2_from_cam1->Inverse();
+  for (auto& match : reversed.inlier_matches) std::swap(match.idx1, match.idx2);
+  return reversed;
+}
+
 void SetVerifiedGeometry(MatchGraph* graph,
                          ImageId image_id1,
                          ImageId image_id2,
@@ -67,8 +81,9 @@ void SetVerifiedGeometry(MatchGraph* graph,
   if (image_id1 == image_id2) {
     throw std::invalid_argument("Cannot store geometry for the same image");
   }
+  TwoViewGeometry ordered = image_id1 > image_id2 ? ReverseTwoViewGeometry(geometry) : geometry;
   graph->verified_geometries[ImagePair::Ordered(image_id1, image_id2)] =
-      geometry;
+      std::move(ordered);
 }
 
 const FeatureSet* FindFeatures(const MatchGraph& graph, ImageId image_id) {

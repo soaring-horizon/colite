@@ -50,6 +50,62 @@ TEST(ObservationManagerTest, AddsObservationAndKeepsImageTrackConsistent) {
   EXPECT_EQ(reconstruction.GetPoint3D(point3d_id).track.Length(), 2U);
 }
 
+TEST(ObservationManagerTest, MutationVersionIncludesLinkRepairsOutsideTracking) {
+  auto reconstruction = MakeReconstructionWithTwoImages();
+  const auto initial_version = reconstruction.Point3DChangeVersion();
+  Track track;
+  track.AddElement(1, 0);
+  const auto id = reconstruction.AddPoint3D({0, 0, 5}, track);
+  EXPECT_GT(reconstruction.Point3DChangeVersion(), initial_version);
+  ObservationManager manager(&reconstruction);
+  auto version = reconstruction.Point3DChangeVersion();
+  ASSERT_TRUE(manager.AddObservation(id, 2, 0));
+  EXPECT_GT(reconstruction.Point3DChangeVersion(), version);
+  version = reconstruction.Point3DChangeVersion();
+  EXPECT_FALSE(manager.AddObservation(id, 2, 0));
+  EXPECT_EQ(reconstruction.Point3DChangeVersion(), version);
+  reconstruction.GetImage(2).points2d[0].point3d_id = kInvalidPoint3DId;
+  EXPECT_FALSE(manager.AddObservation(id, 2, 0));
+  EXPECT_EQ(reconstruction.GetImage(2).points2d[0].point3d_id, id);
+  EXPECT_GT(reconstruction.Point3DChangeVersion(), version);
+  version = reconstruction.Point3DChangeVersion();
+  EXPECT_FALSE(reconstruction.DeleteObservation(id, 2, 99));
+  EXPECT_EQ(reconstruction.Point3DChangeVersion(), version);
+  EXPECT_TRUE(reconstruction.DeleteObservation(id, 2, 0));
+  EXPECT_GT(reconstruction.Point3DChangeVersion(), version);
+  version = reconstruction.Point3DChangeVersion();
+  EXPECT_TRUE(reconstruction.DeletePoint3D(id));
+  EXPECT_GT(reconstruction.Point3DChangeVersion(), version);
+  version = reconstruction.Point3DChangeVersion();
+  EXPECT_FALSE(reconstruction.DeletePoint3D(id));
+  EXPECT_EQ(reconstruction.Point3DChangeVersion(), version);
+}
+
+TEST(ObservationManagerTest, CollectsOnlyChangesInsideTheRequestedOperation) {
+  auto reconstruction = MakeReconstructionWithTwoImages();
+  ObservationManager manager(&reconstruction);
+  Track first_track;
+  first_track.AddElement(1, 0);
+  const auto first = reconstruction.AddPoint3D({0, 0, 5}, first_track);
+  EXPECT_TRUE(reconstruction.EndPoint3DChangeTracking().empty());
+  reconstruction.BeginPoint3DChangeTracking();
+  EXPECT_TRUE(manager.AddObservation(first, 2, 0));
+  EXPECT_EQ(reconstruction.EndPoint3DChangeTracking(), (std::set<Point3DId>{first}));
+  EXPECT_FALSE(manager.AddObservation(first, 2, 0));
+  EXPECT_TRUE(reconstruction.EndPoint3DChangeTracking().empty());
+  reconstruction.BeginPoint3DChangeTracking();
+  EXPECT_TRUE(reconstruction.DeleteObservation(first, 2, 0));
+  Track second_track;
+  second_track.AddElement(2, 0);
+  const auto second = *manager.AddPoint3D({0.01, 0, 5}, second_track);
+  EXPECT_TRUE(manager.MergePoints(first, second, {0, 0, 5}));
+  EXPECT_EQ(reconstruction.EndPoint3DChangeTracking(),
+            (std::set<Point3DId>{first, second}));
+  reconstruction.BeginPoint3DChangeTracking();
+  EXPECT_FALSE(reconstruction.DeleteObservation(first, 2, 99));
+  EXPECT_TRUE(reconstruction.EndPoint3DChangeTracking().empty());
+}
+
 TEST(ObservationManagerTest, RejectsObservationLinkedToDifferentPoint) {
   Reconstruction reconstruction = MakeReconstructionWithTwoImages();
   Track track1;

@@ -1,9 +1,62 @@
 #include "colite/sfm/similarity_transform.h"
 
 #include <gtest/gtest.h>
+#include <stdexcept>
+#include "colite/core/geometry.h"
 
 namespace colite {
 namespace {
+
+TEST(SimilarityTransformTest, NormalizationPreservesProjectionAndUsesCameraExtent) {
+  Reconstruction model;
+  Camera camera; camera.id=1; camera.model_id=CameraModelId::kSimplePinhole;
+  camera.width=100; camera.height=100; camera.params={80,50,50};
+  model.AddCamera(camera);
+  const Eigen::Vector3d point(11,21,35);
+  Track track;
+  for (ImageId id : {1,2}) {
+    Image image; image.id=id; image.camera_id=1; image.registered=true;
+    Pose3 pose; pose.t_cw=-Eigen::Vector3d(10+2*(id-1),20,30);
+    image.cam_from_world=pose;
+    image.points2d.push_back({*ProjectWorldPoint(camera,pose,point),0,kInvalidPoint3DId});
+    model.AddImage(image); track.AddElement(id,0);
+  }
+  const auto point_id=model.AddPoint3D(point,track);
+  auto fixed_scale=model;
+  const auto normalized=NormalizeReconstruction(&model);
+  ASSERT_TRUE(normalized.valid);
+  EXPECT_DOUBLE_EQ(normalized.scale,5);
+  EXPECT_LT((model.GetImage(1).cam_from_world->CameraCenter()-Eigen::Vector3d(-5,0,0)).norm(),1e-12);
+  EXPECT_LT((model.GetImage(2).cam_from_world->CameraCenter()-Eigen::Vector3d(5,0,0)).norm(),1e-12);
+  for (ImageId id : {1,2}) {
+    const auto& image=model.GetImage(id);
+    EXPECT_LT(*ReprojectionError(camera,*image.cam_from_world,model.GetPoint3D(point_id).xyz,image.points2d[0].xy),1e-12);
+  }
+  const auto centered=NormalizeReconstruction(&fixed_scale,true);
+  EXPECT_DOUBLE_EQ(centered.scale,1);
+  EXPECT_LT((fixed_scale.GetImage(1).cam_from_world->CameraCenter()-Eigen::Vector3d(-1,0,0)).norm(),1e-12);
+  EXPECT_THROW(NormalizeReconstruction(&fixed_scale,false,0),std::invalid_argument);
+}
+
+TEST(SimilarityTransformTest, NormalizationTrimsCoordinateOutliersAndHandlesOneCamera) {
+  Reconstruction model;
+  Camera camera; camera.id=1; camera.model_id=CameraModelId::kSimplePinhole;
+  camera.width=100; camera.height=100; camera.params={80,50,50}; model.AddCamera(camera);
+  for (ImageId id=1;id<=31;++id) {
+    Image image; image.id=id; image.camera_id=1; image.registered=true;
+    image.cam_from_world=Pose3{};
+    image.cam_from_world->t_cw.x()=-(id==31?1e6:static_cast<double>(id-1));
+    model.AddImage(image);
+    if (id==1) {
+      const auto no_op=NormalizeReconstruction(&model);
+      EXPECT_DOUBLE_EQ(no_op.scale,1);
+      EXPECT_DOUBLE_EQ(no_op.translation.norm(),0);
+    }
+  }
+  const auto normalized=NormalizeReconstruction(&model);
+  EXPECT_NEAR(normalized.scale,10.0/24,1e-12);
+  EXPECT_NEAR(normalized.translation.x(),-15*10.0/24,1e-12);
+}
 
 TEST(SimilarityTransformTest, RecoversKnownTransform) {
   const std::vector<Eigen::Vector3d> source = {

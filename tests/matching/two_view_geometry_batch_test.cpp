@@ -18,6 +18,7 @@ Camera MakeCamera(CameraId id) {
   camera.width = 1000;
   camera.height = 800;
   camera.params = {700.0, 700.0, 500.0, 400.0};
+  camera.has_prior_focal_length = true;
   return camera;
 }
 
@@ -89,6 +90,7 @@ TEST(TwoViewGeometryBatchTest, VerifiesAllCandidatePairsIntoMatchGraph) {
   };
 
   TwoViewGeometryBatchOptions options;
+  options.geometry_options.random_seed = 0;
   options.geometry_options.max_error_px = 1.0;
   options.geometry_options.min_num_inliers = 20;
 

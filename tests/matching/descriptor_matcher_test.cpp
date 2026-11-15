@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <initializer_list>
+#include <limits>
+#include <stdexcept>
 #include <vector>
+#include <random>
 
 #include <gtest/gtest.h>
 
@@ -97,12 +100,29 @@ TEST(DescriptorMatcherTest, PreparedFlannMatchesOneShotMatcher) {
             ToPairs(MatchFeatureSets(features1, features2, options)));
 }
 
+TEST(DescriptorMatcherTest, RejectsIncompatibleLearnedFeatureContract) {
+  FeatureSet sift;
+  FeatureSet aliked;
+  sift.descriptors = MakeBlockDescriptors({0});
+  aliked.extractor_type = FeatureExtractorType::kAlikedN16Rot;
+  aliked.descriptor_metric = DescriptorMetric::kCosine;
+  aliked.descriptors = MakeBlockDescriptors({0});
+
+  DescriptorMatchingOptions options;
+  options.matcher_type = FeatureMatcherType::kSiftBruteForce;
+  EXPECT_THROW(MatchFeatureSets(sift, aliked, options), std::invalid_argument);
+
+  options.matcher_type = FeatureMatcherType::kAlikedBruteForce;
+  EXPECT_THROW(MatchFeatureSets(aliked, aliked, options),
+               std::invalid_argument);
+}
+
 TEST(DescriptorMatcherTest, CudaMatchesCpuBruteForceExactly) {
   if (!IsCudaDescriptorMatcherAvailable()) {
     GTEST_SKIP() << "CUDA descriptor matcher is unavailable";
   }
-  DescriptorMatrix descriptors1(40, 128);
-  DescriptorMatrix descriptors2(44, 128);
+  DescriptorMatrix descriptors1(41, 128);
+  DescriptorMatrix descriptors2(47, 128);
   for (Eigen::Index row = 0; row < descriptors1.rows(); ++row) {
     for (Eigen::Index col = 0; col < descriptors1.cols(); ++col) {
       descriptors1(row, col) = static_cast<float>(
@@ -140,6 +160,12 @@ TEST(DescriptorMatcherTest, CudaMatchesCpuBruteForceExactly) {
                                              cuda_options)),
             ToPairs(MatchDescriptors(descriptors1, descriptors2,
                                      cpu_options)));
+  ReleaseDescriptorMatcherWorkspace();
+  ReleaseDescriptorMatcherWorkspace();
+  EXPECT_EQ(ToPairs(MatchPreparedFeatureSets(prepared1, prepared2,
+                                             cuda_options)),
+            ToPairs(MatchDescriptors(descriptors1, descriptors2,
+                                     cpu_options)));
 }
 
 TEST(DescriptorMatcherTest, RejectsAmbiguousMatchByRatio) {
@@ -152,6 +178,88 @@ TEST(DescriptorMatcherTest, RejectsAmbiguousMatchByRatio) {
   options.mutual_check = false;
 
   EXPECT_TRUE(MatchDescriptors(descriptors1, descriptors2, options).empty());
+}
+
+TEST(DescriptorMatcherTest, PreparedCudaHandlesTensorTileBoundariesAndFallbackDimensions) {
+  if (!IsCudaDescriptorMatcherAvailable()) GTEST_SKIP();
+  std::mt19937 random(29);
+  DescriptorMatchingOptions cpu;
+  cpu.backend = DescriptorMatcherBackend::kBruteForce;
+  DescriptorMatchingOptions gpu = cpu;
+  gpu.backend = DescriptorMatcherBackend::kCudaBruteForce;
+  for (int dimensions : {4, 12, 16, 128, 256}) {
+    for (int rows : {1, 15, 16, 17, 31, 32, 33, 65}) {
+      SCOPED_TRACE(::testing::Message() << dimensions << " dimensions, " << rows << " rows");
+      FeatureSet first, second;
+      first.descriptors.resize(rows, dimensions);
+      second.descriptors.resize(rows + 3, dimensions);
+      for (auto* descriptors : {&first.descriptors, &second.descriptors}) {
+        for (Eigen::Index row = 0; row < descriptors->rows(); ++row) {
+          for (int column = 0; column < dimensions; ++column) {
+            (*descriptors)(row, column) = 1.0F + random() % 1000;
+          }
+          descriptors->row(row).normalize();
+        }
+      }
+      second.descriptors.topRows(rows) = first.descriptors;
+      const auto expected = ToPairs(MatchFeatureSets(first, second, cpu));
+      const PreparedFeatureMatcher prepared1(first, gpu.backend), prepared2(second, gpu.backend);
+      EXPECT_EQ(ToPairs(MatchPreparedFeatureSets(prepared1, prepared2, gpu)), expected);
+      ReleaseDescriptorMatcherWorkspace();
+      EXPECT_EQ(ToPairs(MatchPreparedFeatureSets(prepared1, prepared2, gpu)), expected);
+    }
+  }
+}
+
+TEST(DescriptorMatcherTest, CudaRowReductionHandlesTiesAcrossWarpLanes) {
+  if (!IsCudaDescriptorMatcherAvailable()) GTEST_SKIP();
+  DescriptorMatrix descriptors1 = MakeUnitSiftDescriptors({0, 1});
+  DescriptorMatrix descriptors2(65, 128);
+  for (Eigen::Index row = 0; row < descriptors2.rows(); ++row) {
+    descriptors2.row(row) = MakeUnitSiftDescriptors({2}).row(0);
+  }
+  descriptors2.row(1) = descriptors1.row(0);
+  descriptors2.row(32) = descriptors1.row(0);
+  descriptors2.row(64) = descriptors1.row(1);
+  DescriptorMatchingOptions cpu;
+  cpu.backend = DescriptorMatcherBackend::kBruteForce;
+  cpu.max_ratio = 1.0;
+  DescriptorMatchingOptions gpu = cpu;
+  gpu.backend = DescriptorMatcherBackend::kCudaBruteForce;
+  EXPECT_EQ(ToPairs(MatchDescriptors(descriptors1, descriptors2, gpu)),
+            ToPairs(MatchDescriptors(descriptors1, descriptors2, cpu)));
+  EXPECT_EQ(ToPairs(MatchDescriptors(descriptors1.bottomRows(1), descriptors2.bottomRows(1), gpu)),
+            ToPairs(MatchDescriptors(descriptors1.bottomRows(1), descriptors2.bottomRows(1), cpu)));
+}
+
+TEST(DescriptorMatcherTest, CudaHandlesOddRowsAndTiesAcrossColumnTiles) {
+  if (!IsCudaDescriptorMatcherAvailable()) GTEST_SKIP();
+  FeatureSet first, second;
+  first.descriptors.resize(259, 128);
+  second.descriptors.resize(263, 128);
+  std::mt19937 random(19);
+  std::uniform_real_distribution<float> sample(0, 1);
+  for (int i = 0; i < 259; ++i) {
+    for (int j = 0; j < 128; ++j) first.descriptors(i, j) = sample(random);
+    first.descriptors.row(i).normalize();
+    first.keypoints.push_back({static_cast<float>(i), static_cast<float>(i % 3), 1, 0});
+  }
+  first.descriptors.row(257) = first.descriptors.row(0);
+  for (int i = 0; i < 263; ++i) {
+    const int source = i < 259 ? i : 0;
+    second.descriptors.row(i) = first.descriptors.row(source);
+    second.keypoints.push_back(first.keypoints[source]);
+  }
+  DescriptorMatchingOptions cpu, gpu;
+  gpu.backend = DescriptorMatcherBackend::kCudaBruteForce;
+  const auto expected = MatchFeatureSets(first, second, cpu);
+  ASSERT_GT(expected.size(), 250U);
+  EXPECT_EQ(ToPairs(MatchFeatureSets(first, second, gpu)), ToPairs(expected));
+  Eigen::Matrix3d fundamental = Eigen::Matrix3d::Zero();
+  fundamental(1, 2) = -1;
+  fundamental(2, 1) = 1;
+  EXPECT_EQ(ToPairs(MatchFeatureSetsGuidedFundamental(first, second, fundamental, 0.5, gpu)),
+            ToPairs(MatchFeatureSetsGuidedFundamental(first, second, fundamental, 0.5, cpu)));
 }
 
 TEST(DescriptorMatcherTest, RejectsMatchBeyondColmapMaxDistance) {
@@ -231,6 +339,59 @@ TEST(DescriptorMatcherTest, GuidedSearchRecoversMatchBehindOffEpipolarDistractor
     ASSERT_EQ(cuda_guided.size(), guided.size());
     EXPECT_EQ(cuda_guided.front().idx1, guided.front().idx1);
     EXPECT_EQ(cuda_guided.front().idx2, guided.front().idx2);
+  }
+}
+
+TEST(DescriptorMatcherTest, GenericGuidanceSharesGeometryGateAcrossBackends) {
+  std::vector<DescriptorMatcherBackend> backends = {
+      DescriptorMatcherBackend::kBruteForce, DescriptorMatcherBackend::kFlann};
+  if (IsCudaDescriptorMatcherAvailable()) backends.push_back(DescriptorMatcherBackend::kCudaBruteForce);
+  for (const auto backend : backends) {
+    SCOPED_TRACE(static_cast<int>(backend));
+    FeatureSet first, second;
+    first.descriptors = MakeUnitSiftDescriptors({0, 1, 2, 3});
+    second.descriptors = first.descriptors;
+    for (int i = 0; i < 4; ++i) {
+      first.keypoints.push_back({100.0F + 100 * i, 200.0F + 100 * i, 1, 0});
+      second.keypoints.push_back(first.keypoints.back());
+    }
+    PreparedFeatureMatcher prepared1(first, backend), prepared2(second, backend);
+    for (const auto type : {GuidedGeometryType::kEpipolar, GuidedGeometryType::kHomography}) {
+      Eigen::Matrix3d matrix = Eigen::Matrix3d::Zero();
+      std::vector<Eigen::Vector2d> xy1, xy2;
+      double threshold = 0;
+      if (type == GuidedGeometryType::kEpipolar) {
+        matrix(1, 2) = 1;
+        matrix(2, 1) = -1;
+        threshold = .001;
+        for (int i = 0; i < 4; ++i) {
+          xy1.emplace_back(-.4 + .2 * i, .1 * i);
+          xy2.emplace_back(xy1.back().x() - .2, xy1.back().y());
+        }
+      } else {
+        matrix.setIdentity();
+        matrix(0, 0) = matrix(1, 1) = .25;
+        threshold = 4;
+        for (const auto& key : first.keypoints) {
+          xy1.emplace_back(key.x, key.y);
+          xy2.emplace_back(.25 * key.x + 3, .25 * key.y);
+        }
+      }
+      // An invalid inverse-projection row is excluded, with original indices
+      // preserved. No second descriptor matrix is built for normalized rays.
+      xy1[2].setConstant(std::numeric_limits<double>::quiet_NaN());
+      for (const bool mutual : {false, true}) {
+        DescriptorMatchingOptions options;
+        options.backend = backend;
+        options.mutual_check = mutual;
+        for (const double scale : {1e-120, 1.0, 1e120}) {
+          const auto matches = MatchPreparedFeatureSetsGuidedGeometry(
+              prepared1, prepared2, type, matrix * scale, xy1, xy2, threshold, options);
+          const std::vector<std::pair<Point2DIdx, Point2DIdx>> expected{{0, 0}, {1, 1}, {3, 3}};
+          EXPECT_EQ(ToPairs(matches), expected);
+        }
+      }
+    }
   }
 }
 

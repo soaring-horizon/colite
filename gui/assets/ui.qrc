@@ -1,0 +1,21 @@
+<RCC>
+  <qresource prefix="/ui">
+    <file alias="colite.png">colite.png</file>
+    <file alias="theme.qss">theme.qss</file>
+    <file alias="check.png">check.png</file>
+    <file alias="chevron.png">chevron.png</file>
+    <file alias="ArrowsOut.png">ArrowsOut.png</file>
+    <file alias="Camera.png">Camera.png</file>
+    <file alias="CircleNotch.png">CircleNotch.png</file>
+    <file alias="Cube.png">Cube.png</file>
+    <file alias="FloppyDisk.png">FloppyDisk.png</file>
+    <file alias="Folder.png">Folder.png</file>
+    <file alias="FolderOpen.png">FolderOpen.png</file>
+    <file alias="Image.png">Image.png</file>
+    <file alias="Selection.png">Selection.png</file>
+    <file alias="SquaresFour.png">SquaresFour.png</file>
+    <file alias="Eye.png">Eye.png</file>
+    <file alias="EyeSlash.png">EyeSlash.png</file>
+    <file alias="user-guide.md">../../docs/desktop_user_guide.md</file>
+  </qresource>
+</RCC>

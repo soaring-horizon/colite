@@ -5,9 +5,28 @@
 #include <gtest/gtest.h>
 
 #include "colite/core/reconstruction.h"
+#include "colite/core/ransac.h"
 
 namespace colite {
 namespace {
+
+TEST(GeometryTest, PointTriangulationAngleUsesAcuteGeometricIntersection) {
+  const Eigen::Vector3d point(0,0,0);
+  EXPECT_NEAR(TriangulationAngleDegrees(Eigen::Vector3d(1,0,0), Eigen::Vector3d(0,1,0), point), 90, 1e-12);
+  EXPECT_DOUBLE_EQ(TriangulationAngleDegrees(Eigen::Vector3d(1,0,0), Eigen::Vector3d(-1,0,0), point), 0);
+  EXPECT_DOUBLE_EQ(TriangulationAngleDegrees(point, Eigen::Vector3d(-1,0,0), point), 0);
+  EXPECT_NEAR(TriangulationAngleDegrees(Eigen::Vector3d(1,0,0), Eigen::Vector3d(-1,1,0), point), 45, 1e-12);
+}
+
+TEST(RansacTrialsTest, AccountsForFinitePopulationAndConfidence) {
+  EXPECT_GT(RansacTrials(5, 10, 3, .99, 10000),
+            RansacTrials(500, 1000, 3, .99, 10000));
+  EXPECT_GT(RansacTrials(50, 100, 3, .99999, 10000),
+            RansacTrials(50, 100, 3, .99, 10000));
+  EXPECT_EQ(RansacTrials(2, 100, 3, .99, 500), 500);
+  EXPECT_EQ(RansacTrials(50, 100, 3, 1, 500), 500);
+  EXPECT_EQ(RansacTrials(100, 100, 3, .99, 500), 1);
+}
 
 Camera MakePinholeCamera() {
   Camera camera;
@@ -68,6 +87,23 @@ TEST(GeometryTest, ProjectsWorldPointWithPose) {
   EXPECT_NEAR(pixel->y(), 380.0, 1e-12);
 }
 
+TEST(GeometryTest, NonInvertiblePixelsDoNotTriangulateOrCreateCenterRays) {
+  auto camera = MakePinholeCamera();
+  camera.model_id = CameraModelId::kSimpleRadial;
+  camera.params = {700, 500, 400, -1};
+  const auto first = CameraAt({0, 0, 0}), second = CameraAt({.4, 0, 0});
+  const Eigen::Vector3d xyz(.1, .1, 4);
+  const auto a = ProjectWorldPoint(camera, first, xyz);
+  const auto b = ProjectWorldPoint(camera, second, xyz);
+  ASSERT_TRUE(a && b);
+  ASSERT_TRUE(TryPixelToBearing(camera, *a));
+  EXPECT_FALSE(TryPixelToBearing(camera, {0, 0}));
+  EXPECT_FALSE(TriangulatePoint(camera, first, {0, 0}, camera, second, *b));
+  const auto actual = TriangulatePoint(camera, first, *a, camera, second, *b);
+  ASSERT_TRUE(actual);
+  EXPECT_NEAR((*actual - xyz).norm(), 0, 1e-8);
+}
+
 TEST(GeometryTest, ReprojectionErrorIsMeasuredInPixels) {
   const Camera camera = MakePinholeCamera();
   const Pose3 pose = CameraAt(Eigen::Vector3d::Zero());
@@ -80,7 +116,7 @@ TEST(GeometryTest, ReprojectionErrorIsMeasuredInPixels) {
   EXPECT_NEAR(*error, 5.0, 1e-12);
 }
 
-TEST(GeometryTest, ComputesPointTrackRootMeanSquaredReprojectionError) {
+TEST(GeometryTest, ComputesColmapMeanPointTrackReprojectionError) {
   Reconstruction reconstruction;
   const Camera camera = MakePinholeCamera();
   reconstruction.AddCamera(camera);
@@ -106,7 +142,12 @@ TEST(GeometryTest, ComputesPointTrackRootMeanSquaredReprojectionError) {
   const auto error = Point3DTrackReprojectionError(reconstruction, point);
 
   ASSERT_TRUE(error.has_value());
-  EXPECT_NEAR(*error, std::sqrt(12.5), 1e-12);
+  // COLMAP averages the two pixel distances (5 and 0), rather than their squares.
+  EXPECT_NEAR(*error, 2.5, 1e-12);
+  point.reprojection_error = 99.0;
+  reconstruction.AddPoint3D(point);
+  UpdatePoint3DReprojectionErrors(&reconstruction);
+  EXPECT_NEAR(reconstruction.GetPoint3D(1).reprojection_error, 2.5, 1e-12);
 }
 
 TEST(GeometryTest, TriangulatesPointFromTwoViews) {

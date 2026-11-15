@@ -7,6 +7,9 @@ target_include_directories(colite_poisson_recon PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_compile_definitions(colite_poisson_recon PRIVATE RELEASE)
+if(WIN32)
+  target_compile_definitions(colite_poisson_recon PRIVATE NOMINMAX)
+endif()
 target_compile_options(colite_poisson_recon PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wno-write-strings>
   $<$<CXX_COMPILER_ID:MSVC>:/bigobj>

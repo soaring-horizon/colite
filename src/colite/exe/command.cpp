@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "colite/core/version.h"
+#include "colite/features/aliked_extractor.h"
 #include "colite/exe/compare_colmap.h"
 #include "colite/exe/feature_extractor.h"
 #include "colite/exe/mapper.h"
@@ -41,11 +42,15 @@ constexpr Command kCommands[] = {
      &RunSpatialMatcher},
     {"vocab_tree_matcher", "Retrieve candidate pairs with visual words.",
      &RunVocabTreeMatcher},
+    {"transitive_matcher", "Expand verified paths and match new image pairs.",
+     &RunTransitiveMatcher},
     {"vocab_tree_builder", "Build a persistent hierarchical vocabulary tree.",
      &RunVocabTreeBuilder},
-    {"mapper", "Run incremental SfM from a file workspace.", &RunMapper},
-    {"compare_colmap", "Write fixed COLMAP text model difference reports.",
+    {"mapper", "Run incremental or global SfM from a file workspace.", &RunMapper},
+    {"compare_colmap", "Write COLMAP TXT/BIN model difference reports.",
      &RunCompareColmap},
+    {"model_converter", "Convert COLMAP-compatible sparse models between TXT/BIN.",
+     &RunModelConverter},
     {"model_analyzer", "Analyze a COLMAP-compatible sparse model.",
      &RunModelAnalyzer},
     {"model_transformer", "Apply a Sim(3) matrix to a sparse model.",
@@ -96,6 +101,12 @@ void PrintHelp(const std::string& executable, std::ostream& out) {
     out << "  " << command.name << "\n"
         << "      " << command.description << "\n";
   }
+  out << "\nGlobal logging options (COLMAP 4):\n"
+      << "  --log_target <stderr|stdout|file|stderr_and_file> Default stderr_and_file.\n"
+      << "  --log_path <directory> Default glog log directory.\n"
+      << "  --log_level <int> Verbose detail level; default 0.\n"
+      << "  --log_severity <0|1|2|3> INFO/WARNING/ERROR/FATAL; default 0.\n"
+      << "  --log_color <0|1> Default 1.\n";
 }
 
 const Command* FindCommand(const std::string_view name) {
@@ -131,6 +142,23 @@ int RunColite(const std::vector<std::string>& args,
   }
   if (args[1] == "--version") {
     out << colite::Version() << "\n";
+    return 0;
+  }
+  if (args[1] == "--capabilities") {
+    out << "{\"global_mapping\":true,\"learned_features\":";
+#ifdef COLITE_ENABLE_ONNX
+    out << "true";
+#else
+    out << "false";
+#endif
+    out << ",\"learned_cuda\":" << (IsOnnxCudaExecutionProviderAvailable() ? "true" : "false");
+    out << ",\"delaunay\":";
+#ifdef COLITE_ENABLE_DELAUNAY_MESHING
+    out << "true";
+#else
+    out << "false";
+#endif
+    out << "}\n";
     return 0;
   }
 

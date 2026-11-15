@@ -31,6 +31,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -47,6 +49,7 @@
 
 #if defined(COLITE_ENABLE_POISSON_MESHING)
 #include "PoissonRecon.h"
+#include "MultiThreading.h"
 #include "SurfaceTrimmer.h"
 #endif
 
@@ -79,6 +82,10 @@ std::vector<char*> MutableArguments(std::vector<std::string>* arguments) {
 class ScopedOpenMpThreads {
  public:
   explicit ScopedOpenMpThreads(int requested) {
+    previous_poisson_ = ::PoissonRecon::ThreadPool::NumThreads();
+    ::PoissonRecon::ThreadPool::SetNumThreads(requested > 0
+        ? static_cast<unsigned>(requested)
+        : std::max(1U, std::thread::hardware_concurrency()));
 #if defined(_OPENMP)
     previous_ = omp_get_max_threads();
     if (requested > 0) omp_set_num_threads(requested);
@@ -87,6 +94,7 @@ class ScopedOpenMpThreads {
 #endif
   }
   ~ScopedOpenMpThreads() {
+    ::PoissonRecon::ThreadPool::SetNumThreads(previous_poisson_);
 #if defined(_OPENMP)
     omp_set_num_threads(previous_);
 #endif
@@ -94,6 +102,7 @@ class ScopedOpenMpThreads {
 
  private:
   int previous_ = 1;
+  unsigned previous_poisson_ = 1;
 };
 #endif
 
@@ -157,6 +166,9 @@ bool PoissonMeshing(const PoissonMeshingOptions& options,
 #if !defined(COLITE_ENABLE_POISSON_MESHING)
   throw std::runtime_error("Poisson meshing was disabled at build time.");
 #else
+  // The bundled command parser and thread pool hold process-wide state.
+  static std::mutex poisson_mutex;
+  const std::lock_guard<std::mutex> lock(poisson_mutex);
   if (!output_path.parent_path().empty()) {
     std::filesystem::create_directories(output_path.parent_path());
   }
@@ -172,11 +184,9 @@ bool PoissonMeshing(const PoissonMeshingOptions& options,
                                         "--depth",
                                         std::to_string(options.depth),
                                         "--ascii"};
-  // PoissonRecon's default full depth is five and must not exceed depth.
-  if (options.depth < 5) {
-    arguments.insert(arguments.end(),
-                     {"--fullDepth", std::to_string(options.depth)});
-  }
+  // Set this on every embedded invocation: parser values survive calls.
+  arguments.insert(arguments.end(),
+                   {"--fullDepth", std::to_string(std::min(5, options.depth))});
   if (options.color) {
     arguments.push_back("--colors");
   }
@@ -605,6 +615,9 @@ DenseTriangleMesh DelaunayMeshing(
       int selected_side = -1;
       double selected_distance = 0.0;
       for (int side = 0; side < 4; ++side) {
+        // An infinite facet contains CGAL's undefined infinite vertex point.
+        // Only the finite hull facet of an infinite cell has geometry.
+        if (triangulation.is_infinite(Delaunay::Facet(behind, side))) continue;
         Kernel::Point_3 intersection_point;
         if (!CGAL::assign(intersection_point,
                           CGAL::intersection(
@@ -677,25 +690,35 @@ DenseTriangleMesh DelaunayMeshing(
   const double maximum_side_length =
       options.max_side_length_factor *
       Percentile(side_lengths, options.max_side_length_percentile);
-  std::unordered_map<Delaunay::Vertex_handle, int,
-                     HandleHash<Delaunay::Vertex_handle>>
-      vertex_indices;
+  // CGAL cell traversal depends on allocation/insertion history. Preserve
+  // winding, but emit the surface in stable input-point order so downstream
+  // simplification receives identical meshes from standalone and pipelines.
+  std::vector<std::array<std::size_t, 3>> faces;
+  std::vector<std::size_t> vertex_ids;
   for (std::size_t facet_index = 0; facet_index < surface_facets.size();
        ++facet_index) {
     if (side_lengths[facet_index] > maximum_side_length) {
       continue;
     }
     const Delaunay::Facet& facet = surface_facets[facet_index];
-    Eigen::Vector3i triangle;
+    std::array<std::size_t, 3> triangle;
     for (int corner = 0; corner < 3; ++corner) {
       const Delaunay::Vertex_handle vertex = facet.first->vertex(
           triangulation.vertex_triple_index(facet.second, corner));
-      auto inserted = vertex_indices.emplace(
-          vertex, static_cast<int>(mesh.vertices.size()));
-      if (inserted.second) {
-        mesh.vertices.push_back(points.at(vertex->info()));
-      }
-      triangle[corner] = inserted.first->second;
+      triangle[corner] = vertex->info();
+      vertex_ids.push_back(vertex->info());
+    }
+    std::rotate(triangle.begin(), std::min_element(triangle.begin(), triangle.end()), triangle.end());
+    faces.push_back(triangle);
+  }
+  std::sort(vertex_ids.begin(), vertex_ids.end());
+  vertex_ids.erase(std::unique(vertex_ids.begin(), vertex_ids.end()), vertex_ids.end());
+  for (const auto id : vertex_ids) mesh.vertices.push_back(points.at(id));
+  std::sort(faces.begin(), faces.end());
+  for (const auto& face : faces) {
+    Eigen::Vector3i triangle;
+    for (int corner = 0; corner < 3; ++corner) {
+      triangle[corner] = static_cast<int>(std::lower_bound(vertex_ids.begin(), vertex_ids.end(), face[corner]) - vertex_ids.begin());
     }
     mesh.triangles.push_back(triangle);
   }
@@ -703,5 +726,66 @@ DenseTriangleMesh DelaunayMeshing(
 }
 
 #endif
+
+DenseTriangleMesh SparseDelaunayMeshing(
+    const DelaunayMeshingOptions& options,
+    const Reconstruction& reconstruction) {
+  if (!IsDelaunayMeshingAvailable()) {
+    throw std::runtime_error("Delaunay meshing requires CGAL support.");
+  }
+  if (!options.Check()) throw std::invalid_argument("Invalid Delaunay meshing options.");
+  if (reconstruction.RegisteredImageIds().size() > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("Too many registered images for Delaunay visibility.");
+  }
+  std::vector<PatchMatchView> views;
+  std::unordered_map<ImageId, std::uint32_t> view_indices;
+  for (const ImageId id : reconstruction.RegisteredImageIds()) {
+    const auto& image = reconstruction.GetImage(id);
+    if (!image.cam_from_world) throw std::invalid_argument("Registered image has no pose.");
+    PatchMatchView view;
+    view.image_id = id;
+    view.camera = reconstruction.GetCamera(image.camera_id);
+    view.cam_from_world = *image.cam_from_world;
+    view_indices.emplace(id, static_cast<std::uint32_t>(views.size()));
+    views.push_back(std::move(view));
+  }
+  // Stable IDs avoid unordered-map iteration changing subsampling across IO
+  // formats or hash-table capacity. Coordinates still enter CGAL as float.
+  std::vector<Point3DId> point_ids;
+  point_ids.reserve(reconstruction.Points3D().size());
+  for (const auto& [id, point] : reconstruction.Points3D()) point_ids.push_back(id);
+  std::sort(point_ids.begin(), point_ids.end());
+  std::vector<FusedPoint> points;
+  std::vector<std::vector<std::uint32_t>> visibility;
+  points.reserve(point_ids.size());
+  visibility.reserve(point_ids.size());
+  for (const auto id : point_ids) {
+    const auto& source = reconstruction.GetPoint3D(id);
+    FusedPoint point;
+    point.xyz = source.xyz;
+    point.color = source.color;
+    std::vector<std::uint32_t> visible;
+    visible.reserve(source.track.Length());
+    for (const auto& observation : source.track.elements) {
+      const auto view = view_indices.find(observation.image_id);
+      if (view == view_indices.end()) {
+        throw std::invalid_argument("Sparse point track references an unregistered image.");
+      }
+      const auto& image = reconstruction.GetImage(observation.image_id);
+      if (observation.point2d_idx >= image.points2d.size() ||
+          image.points2d[observation.point2d_idx].point3d_id != id) {
+        throw std::invalid_argument("Sparse point track has an inconsistent 2D observation.");
+      }
+      visible.push_back(view->second);
+    }
+    std::sort(visible.begin(), visible.end());
+    if (std::adjacent_find(visible.begin(), visible.end()) != visible.end()) {
+      throw std::invalid_argument("Sparse point track contains duplicate image observations.");
+    }
+    points.push_back(std::move(point));
+    visibility.push_back(std::move(visible));
+  }
+  return DelaunayMeshing(options, points, visibility, views);
+}
 
 }  // namespace colite::mvs

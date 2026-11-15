@@ -9,10 +9,13 @@
 
 #include <Eigen/Geometry>
 #include <ceres/ceres.h>
+#include <glog/logging.h>
 
 #include "colite/core/geometry.h"
 #include "colite/core/parallel.h"
 #include "ceres_manifold_compat.h"
+#include "bundle_adjustment_utils.h"
+#include "reprojection_cost.h"
 
 namespace colite {
 namespace {
@@ -356,22 +359,9 @@ std::map<ImageId, std::vector<int>> BuildGaugeTranslationConstraints(
     const std::set<ImageId>& constant_pose_image_ids,
     const std::map<ImageId, std::vector<int>>& explicit_constraints,
     std::set<ImageId>* gauge_constant_pose_image_ids) {
-  std::map<ImageId, std::vector<int>> constraints = explicit_constraints;
-  if (gauge_constant_pose_image_ids == nullptr ||
-      gauge_fixing == BundleGaugeFixing::kNone || pose_blocks.empty() ||
-      !constant_pose_image_ids.empty()) {
-    return constraints;
-  }
-
-  auto it = pose_blocks.begin();
-  gauge_constant_pose_image_ids->insert(it->first);
-  if (gauge_fixing == BundleGaugeFixing::kFirstTwoImages) {
-    ++it;
-    if (it != pose_blocks.end()) {
-      constraints.emplace(it->first, std::vector<int>{0});
-    }
-  }
-  return constraints;
+  return bundle_internal::GaugeTranslationConstraints(
+      gauge_fixing, pose_blocks, constant_pose_image_ids, explicit_constraints,
+      gauge_constant_pose_image_ids);
 }
 
 PoseBlock MakePoseBlock(const Pose3& pose) {
@@ -466,6 +456,12 @@ double MeanPositionPriorError(const Reconstruction& reconstruction,
 
 }  // namespace
 
+ceres::CostFunction* bundle_internal::CreateReprojectionCost(
+    CameraModelId model_id, std::size_t num_camera_params,
+    const Eigen::Vector2d& observed_xy) {
+  return new ReprojectionCost(model_id, num_camera_params, observed_xy);
+}
+
 GlobalBundleAdjustmentSummary AdjustGlobalBundle(
     const GlobalBundleAdjustmentOptions& options,
     Reconstruction* reconstruction) {
@@ -475,13 +471,31 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
     return summary;
   }
 
-  const std::vector<Observation> observations =
+  if (const auto error = options.solver.ValidationError(options.max_num_iterations); !error.empty()) {
+    summary.message = error + "; reconstruction unchanged";
+    return summary;
+  }
+  std::vector<Observation> observations =
       CollectRegisteredObservations(*reconstruction);
+  const bool had_observations = !observations.empty();
+  if (options.min_track_length > 0) {
+    observations.erase(std::remove_if(observations.begin(), observations.end(),
+        [&](const Observation& observation) {
+          return reconstruction->GetPoint3D(observation.point3d_id).track.Length() < options.min_track_length;
+        }), observations.end());
+  }
   summary.num_residuals = observations.size();
   summary.initial_mean_reprojection_error =
       MeanReprojectionError(*reconstruction, observations);
   summary.initial_mean_position_error =
       MeanPositionPriorError(*reconstruction, &summary.num_position_priors);
+  if (observations.empty() && had_observations) {
+    summary.success = true;
+    summary.final_mean_reprojection_error = summary.initial_mean_reprojection_error;
+    summary.final_mean_position_error = summary.initial_mean_position_error;
+    summary.message = "No observations meet min_track_length; reconstruction unchanged";
+    return summary;
+  }
   if (reconstruction->RegisteredImageIds().empty() ||
       reconstruction->Points3D().empty() || observations.empty()) {
     summary.message = "Global bundle has no observations";
@@ -489,7 +503,13 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
   }
 
   std::map<ImageId, PoseBlock> pose_blocks;
-  for (const ImageId image_id : reconstruction->RegisteredImageIds()) {
+  std::set<ImageId> observed_image_ids;
+  std::map<Point3DId, std::size_t> point_observation_counts;
+  for (const auto& observation : observations) {
+    observed_image_ids.insert(observation.image_id);
+    ++point_observation_counts[observation.point3d_id];
+  }
+  for (const ImageId image_id : observed_image_ids) {
     const Image& image = reconstruction->GetImage(image_id);
     if (image.HasPose()) {
       pose_blocks.emplace(image_id, MakePoseBlock(*image.cam_from_world));
@@ -497,13 +517,15 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
   }
 
   std::map<Point3DId, PointBlock> point_blocks;
-  for (const auto& [point3d_id, point3d] : reconstruction->Points3D()) {
-    point_blocks.emplace(point3d_id, MakePointBlock(point3d));
+  for (const auto& [point3d_id, count] : point_observation_counts) {
+    point_blocks.emplace(point3d_id,
+                         MakePointBlock(reconstruction->GetPoint3D(point3d_id)));
   }
 
   std::map<CameraId, std::vector<double>> camera_blocks;
-  for (const auto& [camera_id, camera] : reconstruction->Cameras()) {
-    camera_blocks.emplace(camera_id, camera.params);
+  for (const auto& [image_id, pose] : pose_blocks) {
+    const auto camera_id = reconstruction->GetImage(image_id).camera_id;
+    camera_blocks.emplace(camera_id, reconstruction->GetCamera(camera_id).params);
   }
 
   ceres::Problem problem;
@@ -520,12 +542,17 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
   for (auto& [image_id, block] : pose_blocks) {
     ceres_compat::AddEigenQuaternionParameterBlock(&problem, block.q_xyzw);
     problem.AddParameterBlock(block.t, 3);
-    if (!options.refine_poses ||
+    const bool constant_pose =
+        !options.refine_poses ||
         constant_pose_image_ids.find(image_id) !=
-            constant_pose_image_ids.end()) {
+            constant_pose_image_ids.end();
+    if (constant_pose) {
       problem.SetParameterBlockConstant(block.q_xyzw);
       problem.SetParameterBlockConstant(block.t);
     } else {
+      if (options.constant_pose_rotation || options.constant_rotation_image_ids.count(image_id) > 0) {
+        problem.SetParameterBlockConstant(block.q_xyzw);
+      }
       ++summary.num_variable_images;
       const auto translation_it = constant_translation_idxs.find(image_id);
       if (translation_it != constant_translation_idxs.end() &&
@@ -537,13 +564,11 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
     }
   }
 
-  // 若调用方没有指定固定图像，则固定第一张已注册图像消除规范自由度。
-  if (options.constant_image_ids.empty() && !pose_blocks.empty()) {
-  }
-
   for (auto& [point3d_id, block] : point_blocks) {
     problem.AddParameterBlock(block.xyz, 3);
-    if (!options.refine_points) {
+    const auto count = point_observation_counts.at(point3d_id);
+    if (!options.refine_points || count < 2 ||
+        count < reconstruction->GetPoint3D(point3d_id).track.Length()) {
       problem.SetParameterBlockConstant(block.xyz);
     } else {
       (void)point3d_id;
@@ -588,8 +613,8 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
         options.loss_scale > 0.0 ? new ceres::SoftLOneLoss(options.loss_scale)
                                  : nullptr;
     problem.AddResidualBlock(
-        new ReprojectionCost(camera.model_id, camera.params.size(),
-                             observation.xy),
+        bundle_internal::CreateReprojectionCost(
+            camera.model_id, camera.params.size(), observation.xy),
         loss_function,
         pose_blocks.at(observation.image_id).q_xyzw,
         pose_blocks.at(observation.image_id).t,
@@ -620,14 +645,30 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
     }
   }
 
-  ceres::Solver::Options solver_options;
-  solver_options.max_num_iterations = options.max_num_iterations;
-  solver_options.linear_solver_type = ceres::SPARSE_SCHUR;
-  solver_options.minimizer_progress_to_stdout = false;
-  solver_options.num_threads = parallel::getNumThreads();
+  const ceres::Solver::Options solver_options = bundle_internal::CreateSolverOptions(
+      options.solver, options.max_num_iterations, pose_blocks.size(), problem);
+  summary.requested_linear_solver_type = ceres::LinearSolverTypeToString(solver_options.linear_solver_type);
+  summary.solver_num_threads = solver_options.num_threads;
+  summary.solver_max_num_iterations = solver_options.max_num_iterations;
+  summary.solver_gradient_tolerance = solver_options.gradient_tolerance;
+  summary.num_scalar_residuals = problem.NumResiduals();
 
   ceres::Solver::Summary solver_summary;
+  VLOG(1) << "Global BA begin: images=" << pose_blocks.size()
+          << " points=" << point_blocks.size()
+          << " observations=" << observations.size();
   ceres::Solve(solver_options, &problem, &solver_summary);
+  VLOG(1) << "Global BA end: " << solver_summary.BriefReport()
+          << " unsuccessful_steps=" << solver_summary.num_unsuccessful_steps;
+  bundle_internal::RecordSolverSummary(solver_summary, &summary);
+  summary.success = bundle_internal::CanCommitSolution(
+      solver_summary, pose_blocks, point_blocks, camera_blocks);
+  if (!summary.success) {
+    summary.final_mean_reprojection_error = summary.initial_mean_reprojection_error;
+    summary.final_mean_position_error = summary.initial_mean_position_error;
+    summary.message += "; reconstruction unchanged (unusable or non-finite solution)";
+    return summary;
+  }
 
   for (const auto& [image_id, block] : pose_blocks) {
     Image& image = reconstruction->GetImage(image_id);
@@ -644,8 +685,6 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
       MeanReprojectionError(*reconstruction, observations);
   summary.final_mean_position_error =
       MeanPositionPriorError(*reconstruction, nullptr);
-  summary.success = solver_summary.IsSolutionUsable();
-  summary.message = solver_summary.BriefReport();
   return summary;
 }
 

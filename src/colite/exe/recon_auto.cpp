@@ -10,6 +10,10 @@
 #include "colite/exe/mvs_stages.h"
 #include "colite/exe/mvs_tools.h"
 #include "colite/exe/recon_sfm.h"
+#include "colite/exe/recon_mvs.h"
+#include "colite/controllers/sfm_options.h"
+#include "colite/features/feature_mask.h"
+#include "colite/features/sift_extractor.h"
 #include "colite/exe/stage.h"
 
 namespace colite::exe {
@@ -48,11 +52,32 @@ void AppendOptionsWithPrefix(
   }
 }
 
+void AppendMvsOptions(const std::map<std::string, std::string>& values,
+                      MvsOptionScope scope, std::vector<std::string>* args) {
+  for (const auto& [name, value] : values) {
+    if (name.rfind("--mvs.", 0) != 0) continue;
+    const std::string option = "--" + name.substr(6);
+    if (MvsOptionAppliesTo(option, scope)) {
+      args->insert(args->end(), {option, value});
+    }
+  }
+}
+
+void AppendTextureOptions(const std::map<std::string, std::string>& values,
+                           std::vector<std::string>* args) {
+  AppendOptionsWithPrefix(values, "--MeshTextureMapping.", args, false);
+  for (const auto& [name, value] : values) {
+    if (name.rfind("--Colite.texture_", 0) != 0) continue;
+    args->insert(args->end(), {name == "--Colite.texture_output_type" ? "--output_type" : name, value});
+  }
+}
+
 }  // namespace
 
-int RunReconAuto(const std::vector<std::string>& args,
+int RunReconAuto(const std::vector<std::string>& raw_args,
                  std::ostream& out, std::ostream& err) {
   try {
+    const auto args = NormalizeMvsArguments(raw_args);
     std::map<std::string, std::string> values;
     StageOptions stage;
     bool help = false;
@@ -75,15 +100,32 @@ int RunReconAuto(const std::vector<std::string>& args,
              "[--stop_after sfm|undistort|stereo|fusion|mesh|simplify|texture] "
              "[--mesher poisson|delaunay|none] [--simplify 0|1] "
              "[--texture 0|1] "
-             "[--sfm.camera_model SIMPLE_RADIAL] "
-             "[--sfm.camera_params CSV] "
-             "[--sfm.camera_mode auto|single|per_folder|per_image] "
+             "[--sfm.ImageReader.camera_model SIMPLE_RADIAL] "
+             "[--sfm.ImageReader.camera_params CSV] "
+             "[--sfm.ImageReader.single_camera 0|1] "
              "[--sfm.<option> value] [--mvs.<option> value] "
              "[--resume|--force] [--dry_run]\n";
       return 0;
     }
     if (stage.resume && stage.force) {
       throw std::invalid_argument("--resume and --force are mutually exclusive");
+    }
+    for (const auto& [name, value] : values) {
+      if (name == "--image_path" || name == "--output_path" ||
+          name == "--start_from" || name == "--stop_after" ||
+          name == "--mesher" || name == "--simplify" || name == "--texture" ||
+          name.rfind("--sfm.", 0) == 0 || name.rfind("--PoissonMeshing.", 0) == 0 ||
+          name.rfind("--DelaunayMeshing.", 0) == 0 || name.rfind("--MeshSimplification.", 0) == 0 ||
+          name.rfind("--MeshTextureMapping.", 0) == 0 || name.rfind("--Colite.texture_", 0) == 0) continue;
+      if (name.rfind("--mvs.", 0) != 0) throw std::invalid_argument("Unknown argument: " + name);
+      const std::string option = "--" + name.substr(6);
+      if (option == "--input_path" || option == "--output_path" || option == "--image_path" ||
+          option == "--workspace_path" ||
+          !(MvsOptionAppliesTo(option, MvsOptionScope::kUndistorter) ||
+            MvsOptionAppliesTo(option, MvsOptionScope::kPatchMatch) ||
+            MvsOptionAppliesTo(option, MvsOptionScope::kFusion))) {
+        throw std::invalid_argument("Unknown or reserved pipeline argument: " + name);
+      }
     }
     const std::filesystem::path images = Require(values, "--image_path");
     const std::filesystem::path root = Require(values, "--output_path");
@@ -118,18 +160,65 @@ int RunReconAuto(const std::vector<std::string>& args,
     };
     const auto sfm = root / "sfm";
     const auto mvs = root / "mvs";
-    const auto dense_workspace = mvs / "undistorted";
+    const auto dense_workspace = mvs;
+    // Validate every MVS option before starting SfM, including disabled stages.
+    for (const auto scope : {MvsOptionScope::kUndistorter, MvsOptionScope::kPatchMatch,
+                             MvsOptionScope::kFusion}) {
+      std::vector<std::string> validation{args.front(), "--input_path", sfm.string(),
+          "--image_path", images.string(), "--output_path",
+          (scope == MvsOptionScope::kFusion ? mvs / "fused.ply" : mvs).string()};
+      if (scope == MvsOptionScope::kFusion) {
+        validation.insert(validation.end(), {"--workspace_path", mvs.string()});
+      }
+      AppendMvsOptions(values, scope, &validation);
+      (void)ParseReconMvsArguments(validation, scope);
+    }
+    // Reject all surface configuration errors before SfM, even when the
+    // corresponding stage is outside the selected execution range.
+    for (const auto& [tool, prefix] :
+         std::vector<std::pair<std::string, std::string>>{
+             {"poisson_mesher", "--PoissonMeshing."},
+             {"delaunay_mesher", "--DelaunayMeshing."},
+             {"mesh_simplifier", "--MeshSimplification."},
+             {"mesh_texturer", "--MeshTextureMapping."}}) {
+      std::vector<std::string> validation{args.front(), "--input_path",
+          (root / "surface/input.ply").string(), "--output_path",
+          (root / "surface/output.ply").string()};
+      if (tool == "mesh_texturer") {
+        validation.insert(validation.end(), {"--workspace_path", mvs.string()});
+        AppendTextureOptions(values, &validation);
+      } else {
+        AppendOptionsWithPrefix(values, prefix, &validation, false);
+      }
+      ValidateSurfaceArguments(tool, validation);
+    }
     if (enabled("sfm")) {
       std::vector<std::string> sfm_args{args.front(), "--image_path", images.string(),
                                         "--output_path", sfm.string()};
       AppendOptionsWithPrefix(values, "--sfm.", &sfm_args, true);
+      auto identity_arguments = sfm_args;
+      identity_arguments.push_back(std::string("@implementation=recon_auto_sfm_cache_v2:") +
+          controllers::SfmMappingImplementationKey());
       if (stage.resume) sfm_args.push_back("--resume");
       if (stage.force) sfm_args.push_back("--force");
+      ValidateReconSfmArguments(sfm_args);
+      ImageMaskOptions masks;
+      if (values.count("--sfm.ImageReader.mask_path")) masks.mask_path = values.at("--sfm.ImageReader.mask_path");
+      if (values.count("--sfm.ImageReader.camera_mask_path")) masks.camera_mask_path = values.at("--sfm.ImageReader.camera_mask_path");
+      if (!masks.Empty()) {
+        identity_arguments.push_back("@image_masks=" +
+            FeatureMasks(images, ListImageFiles(images), masks).Fingerprint());
+      }
       const ColmapModelFormat sfm_format = ColmapModelFormatFromString(
-          values.count("--sfm.output_format")
-              ? values.at("--sfm.output_format")
+          values.count("--sfm.Colite.output_format")
+              ? values.at("--sfm.Colite.output_format")
               : "both");
-      std::vector<std::filesystem::path> sfm_outputs{sfm / "points3D.ply"};
+      std::vector<std::filesystem::path> sfm_outputs{
+          sfm / "points3D.ply", sfm / "models", sfm / "models.txt", sfm / "summary.txt",
+          sfm / "workspace/features", sfm / "workspace/cameras.txt", sfm / "workspace/images.tsv",
+          sfm / "workspace/matches/raw_matches.tsv", sfm / "workspace/matches/verified_matches.tsv",
+          sfm / "workspace/cache/features.txt", sfm / "workspace/cache/matching.txt",
+          sfm / "workspace/cache/geometry.txt", sfm / "workspace/cache/recon_sfm.txt"};
       if (sfm_format == ColmapModelFormat::kText ||
           sfm_format == ColmapModelFormat::kTextAndBinary) {
         sfm_outputs.insert(sfm_outputs.end(),
@@ -142,7 +231,7 @@ int RunReconAuto(const std::vector<std::string>& args,
                            {sfm / "cameras.bin", sfm / "images.bin",
                             sfm / "points3D.bin"});
       }
-      StageSpec spec{"recon_sfm", root, {images}, sfm_outputs, sfm_args};
+      StageSpec spec{"recon_sfm", root, {images}, sfm_outputs, identity_arguments};
       const int result = RunStage(spec, stage,
           [&] { return RunReconSfm(sfm_args, out, err); }, out, err);
       if (result) return result;
@@ -150,25 +239,26 @@ int RunReconAuto(const std::vector<std::string>& args,
     if (enabled("undistort")) {
       std::vector<std::string> command{args.front(), "--image_path", images.string(),
           "--input_path", sfm.string(), "--output_path", mvs.string()};
-      AppendOptionsWithPrefix(values, "--mvs.", &command, true);
+      AppendMvsOptions(values, MvsOptionScope::kUndistorter, &command);
       const auto extra = controls(); command.insert(command.end(), extra.begin(), extra.end());
       const int result = RunImageUndistorter(command, out, err);
       if (result) return result;
     }
     if (enabled("stereo")) {
-      std::vector<std::string> command{args.front(), "--model_path",
+      std::vector<std::string> command{args.front(), "--input_path",
           (dense_workspace / "sparse").string(), "--image_path",
           (dense_workspace / "images").string(), "--output_path", mvs.string()};
-      AppendOptionsWithPrefix(values, "--mvs.", &command, true);
+      AppendMvsOptions(values, MvsOptionScope::kPatchMatch, &command);
       const auto extra = controls(); command.insert(command.end(), extra.begin(), extra.end());
       const int result = RunPatchMatchStereo(command, out, err);
       if (result) return result;
     }
     if (enabled("fusion")) {
-      std::vector<std::string> command{args.front(), "--model_path",
+      std::vector<std::string> command{args.front(), "--input_path",
           (dense_workspace / "sparse").string(), "--image_path",
-          (dense_workspace / "images").string(), "--output_path", mvs.string()};
-      AppendOptionsWithPrefix(values, "--mvs.", &command, true);
+          (dense_workspace / "images").string(), "--workspace_path", mvs.string(),
+          "--output_path", (mvs / "fused.ply").string()};
+      AppendMvsOptions(values, MvsOptionScope::kFusion, &command);
       const auto extra = controls(); command.insert(command.end(), extra.begin(), extra.end());
       const int result = RunStereoFusion(command, out, err);
       if (result) return result;
@@ -182,13 +272,12 @@ int RunReconAuto(const std::vector<std::string>& args,
       std::vector<std::string> command{args.front(), "--stage_root", root.string()};
       if (mesher == "poisson") {
         command.insert(command.end(), {"--input_path",
-            (mvs / "dense" / "fused.ply").string(), "--output_path",
+            (mvs / "fused.ply").string(), "--output_path",
             mesh_path.string()});
         AppendOptionsWithPrefix(values, "--PoissonMeshing.", &command, false);
       } else {
-        command.insert(command.end(), {"--input_path", (mvs / "dense").string(),
-            "--model_path", (dense_workspace / "sparse").string(),
-            "--output_path", mesh_path.string()});
+        command.insert(command.end(), {"--input_path", dense_workspace.string(),
+            "--input_type", "dense", "--output_path", mesh_path.string()});
         AppendOptionsWithPrefix(values, "--DelaunayMeshing.", &command, false);
       }
       const auto extra = controls();
@@ -212,10 +301,9 @@ int RunReconAuto(const std::vector<std::string>& args,
       const auto texture_input = simplify ? simplified_path : mesh_path;
       std::vector<std::string> command{
           args.front(), "--input_path", texture_input.string(), "--output_path",
-          (surface / "textured").string(), "--model_path",
-          (dense_workspace / "sparse").string(), "--image_path",
-          (dense_workspace / "images").string(), "--stage_root", root.string()};
-      AppendOptionsWithPrefix(values, "--MeshTextureMapping.", &command, false);
+          (surface / "textured").string(), "--workspace_path",
+          dense_workspace.string(), "--stage_root", root.string()};
+      AppendTextureOptions(values, &command);
       const auto extra = controls();
       command.insert(command.end(), extra.begin(), extra.end());
       const int result = RunMeshTexturer(command, out, err);

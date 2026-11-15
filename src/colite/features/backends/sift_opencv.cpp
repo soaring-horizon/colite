@@ -829,7 +829,7 @@ void findScaleSpaceExtrema(const std::vector<Image> &gauss_pyr,
                             int nOctaves, int nOctaveLayers,
                             const std::vector<Image> &dog_pyr,
                             float contrastThreshold,
-                            float edgeThreshold, float sigma,
+                            float edgeThreshold, float sigma, int maxOrientations,
                             std::vector<KeyPoint> &kpts)
 {
     int nLayersPerOct = nOctaveLayers + 3;
@@ -918,7 +918,9 @@ void findScaleSpaceExtrema(const std::vector<Image> &gauss_pyr,
                             hist, SIFT_ORI_HIST_BINS);
 
                         float mag_thr = omax * SIFT_ORI_PEAK_RATIO;
+                        int orientationCount = 0;
                         for (int j = 0; j < SIFT_ORI_HIST_BINS; j++) {
+                            if (maxOrientations > 0 && orientationCount >= maxOrientations) break;
                             int l = j > 0 ? j - 1 : SIFT_ORI_HIST_BINS - 1;
                             int r2 = j < SIFT_ORI_HIST_BINS - 1 ? j + 1 : 0;
 
@@ -931,6 +933,7 @@ void findScaleSpaceExtrema(const std::vector<Image> &gauss_pyr,
                                 if (std::fabs(kpt.angle - 360.f) < FLT_EPSILON)
                                     kpt.angle = 0.f;
                                 rowOut.push_back(kpt);
+                                ++orientationCount;
                             }
                         }
                     }
@@ -1162,10 +1165,11 @@ void Sift::detectAndCompute(const float *image, int width, int height,
     keypoints.clear();
     descriptors.clear();
 
-    int firstOctave = -1;
+    const int firstOctave = firstOctaveIndex;
 
     /* Create initial image */
-    float sig_diff = std::sqrt(std::max(sigma*sigma - SIFT_INIT_SIGMA*SIFT_INIT_SIGMA*4, 0.01));
+    const double nominalScale = firstOctave < 0 ? 2.0 : 1.0;
+    float sig_diff = std::sqrt(std::max(sigma*sigma - SIFT_INIT_SIGMA*SIFT_INIT_SIGMA*nominalScale*nominalScale, 0.01));
     GaussianWorkspace gaussianWorkspace;
     std::vector<float> initialKernel;
     buildGaussianKernel(initialKernel, sig_diff);
@@ -1190,6 +1194,7 @@ void Sift::detectAndCompute(const float *image, int width, int height,
     /* Number of octaves */
     int nOctaves = std::max((int)(std::log(std::min(base.width, base.height)) / std::log(2.0) - 2), 1);
     nOctaves -= firstOctave; /* subtract -1 = add 1 */
+    if (maxOctaveCount > 0) nOctaves = std::min(nOctaves, maxOctaveCount);
 
     int nLayers = nOctaveLayers + 3;
 
@@ -1255,7 +1260,7 @@ void Sift::detectAndCompute(const float *image, int width, int height,
     /* Detect keypoints */
     findScaleSpaceExtrema(gpyr, nOctaves, nOctaveLayers,
                            dogpyr, (float)contrastThreshold,
-                           (float)edgeThreshold, (float)sigma,
+                           (float)edgeThreshold, (float)sigma, maxOrientationCount,
                            keypoints);
     const auto extremaEnd = Clock::now();
 

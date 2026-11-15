@@ -1,22 +1,16 @@
-# Changelog
+# 变更记录
 
-All notable public changes to Colite are documented here.
+## 0.2.0 — 2026-11-15
 
-## [Unreleased]
+- 新增 Windows / Linux 原生桌面工作台：未命名工程、照片和文件夹导入、最近五个工程、草稿恢复，以及按阶段配置、重跑和导出。
+- 新增统一的 2D 特征检查、3D 点云与网格预览、任务日志和加载进度；大模型可按预算缩减预览。
+- GUI 默认使用去畸变图像半宽、半高估计深度，默认 Poisson 深度为 9；纹理和 CLI 的分辨率配置独立。
+- 扩展全局与分层稀疏重建、可选的 ALIKED / LightGlue，以及 COLMAP 4.0 模型与工作区互通。
+- 增加双平台源码构建、离线交换、安装冒烟测试和发行包核验工具。
 
-- Prepare the project for its first public GitHub release.
-- Add project and third-party license documentation.
-- Add portable CPU/CUDA presets, installation rules, and Linux CI.
-- Exclude local datasets and generated reconstruction results from releases.
+## 0.1.0 — 2026-08-10
 
-## [0.1.0] - 2026-08-10
+- 首个 CLI Alpha 源码版。支持增量 SfM、CPU 与可选 CUDA、COLMAP 稀疏模型、稠密点云、网格和纹理输出。
+- 提供分阶段缓存与恢复，未包含桌面工作台。
 
-Initial alpha release candidate:
-
-- Complete incremental SfM and MVS command-line pipeline.
-- CPU and CUDA SIFT, matching, and PatchMatch backends.
-- Multiple sparse models, model continuation and COLMAP text/binary I/O.
-- Twelve camera models, EXIF camera grouping, and optional GPS priors.
-- RGB sparse/dense point clouds, Poisson/Delaunay meshing, simplification, and
-  textured OBJ output.
-- Resumable stage manifests and independent model/SfM maintenance commands.
+支持范围、验证和限制见[版本说明](docs/release_notes.md)。

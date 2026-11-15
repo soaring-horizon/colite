@@ -1,4 +1,5 @@
 #include "colite/mvs/patch_match_cuda.h"
+#include "colite/mvs/patch_match_likelihood.h"
 
 #include <algorithm>
 #include <chrono>
@@ -21,6 +22,7 @@ namespace colite::mvs {
 namespace {
 
 constexpr int kThreadsPerBlock = 256;
+constexpr int kSearchThreadsPerBlock = 128;
 constexpr int kMaxCudaSourceImages = 32;
 constexpr int kPoseKOffset = 0;
 constexpr int kPoseROffset = 4;
@@ -54,7 +56,7 @@ struct DeviceCostOptions {
   float sigma_spatial = -1.0F;
   float sigma_color = 0.2F;
   float invalid_cost = 1.0F;
-  float min_variance = 1e-8F;
+  float min_variance = 1e-5F;
   int min_num_valid_sources = 1;
   int max_num_aggregated_costs = 3;
   float geometric_consistency_weight = 0.0F;
@@ -84,6 +86,7 @@ struct DevicePatchMatchOptions {
   float source_min_triangulation_angle_degrees = 1.0F;
   float source_incident_angle_sigma = 0.9F;
   int num_source_samples = 0;
+  std::uint32_t source_sampling_seed = 0;
   float ncc_sigma = 0.6F;
   float previous_selection_probability_weight = 0.5F;
   float min_selection_probability = 0.05F;
@@ -115,6 +118,7 @@ struct DeviceOutputPixel {
   float normal_y = 0.0F;
   float normal_z = 0.0F;
   float cost = 0.0F;
+  std::uint32_t source_mask = 0;
 };
 
 struct CachedCudaDeviceCount {
@@ -1325,6 +1329,8 @@ __device__ float ComputeSourceCostForVariant(
   if (!isfinite(center_source_x) || !isfinite(center_source_y)) {
     return options.cost.invalid_cost;
   }
+  float source_origin = SampleSourceImage(source_images_texture, source,
+      source_idx, center_source_x, center_source_y);
   const float sweep_cos =
       ReadPose(poses_texture, source_idx, variant_idx, kPoseSweepCosOffset);
   const float sweep_sin =
@@ -1402,12 +1408,18 @@ __device__ float ComputeSourceCostForVariant(
                      color_difference * color_difference *
                          color_normalization)
               : 1.0F;
+      // Offset invariance lets us avoid catastrophic cancellation in FP32
+      // moments on bright, weakly textured surfaces. Centering at the warped
+      // center remains stable when the corner lies across a strong edge.
+      // An unavailable center need not invalidate a step=2 sampling window.
+      if (num_samples == 0 && !isfinite(source_origin)) source_origin = src_value;
+      const float src_delta = src_value - source_origin;
       weight_sum += weight;
-      sum_ref += weight * ref_value;
-      sum_src += weight * src_value;
-      sum_ref2 += weight * ref_value * ref_value;
-      sum_src2 += weight * src_value * src_value;
-      sum_cross += weight * ref_value * src_value;
+      sum_ref += weight * color_difference;
+      sum_src += weight * src_delta;
+      sum_ref2 += weight * color_difference * color_difference;
+      sum_src2 += weight * src_delta * src_delta;
+      sum_cross += weight * color_difference * src_delta;
       num_samples++;
       numerator_x += col_step_numerator_x;
       numerator_y += col_step_numerator_y;
@@ -1515,28 +1527,40 @@ __device__ float ComputeRobustGeometricConsensusCost(
     const DevicePatchMatchOptions& options,
     int col,
     int row,
-    float depth) {
+    float depth,
+    float3 normal) {
   if (!options.cost.robust_geometric_aggregation ||
       source_depth_maps_texture == 0 ||
       options.cost.geometric_consistency_weight <= 0.0F) {
     return 0.0F;
   }
 
+  const auto& camera = options.reference_camera;
+  const float3 point = make_float3((col - camera.cx) / camera.fx * depth,
+      (row - camera.cy) / camera.fy * depth, depth);
+  if (Dot3(normal, point) > 0.0F) {
+    normal = make_float3(-normal.x, -normal.y, -normal.z);
+  }
   float best_errors[kMaxCudaSourceImages];
-  int num_valid = 0;
+  int num_errors = 0;
   for (int source_idx = 0; source_idx < options.num_sources; ++source_idx) {
+    // Back-facing cameras cannot observe this opaque surface. Their depth
+    // belongs to a different surface and must not influence its consensus.
+    const float3 ray = make_float3(
+        ReadPose(poses_texture, source_idx, 0, kPoseCOffset) - point.x,
+        ReadPose(poses_texture, source_idx, 0, kPoseCOffset + 1) - point.y,
+        ReadPose(poses_texture, source_idx, 0, kPoseCOffset + 2) - point.z);
+    if (!(Dot3(normal, ray) > 0.0F)) continue;
     float signed_relative_error = 0.0F;
     float reprojection_error = 0.0F;
-    if (!ComputeSourceDepthRoundTripErrors(
+    float error = options.cost.geometric_max_reprojection_error;
+    if (ComputeSourceDepthRoundTripErrors(
             options, poses_texture, source_depth_maps_texture,
             source_images[source_idx], source_idx, col, row, depth,
             &signed_relative_error, &reprojection_error)) {
-      continue;
+      error = fminf(error, reprojection_error);
     }
-    const float error =
-        fminf(options.cost.geometric_max_reprojection_error,
-              reprojection_error);
-    int insert_idx = num_valid;
+    int insert_idx = num_errors;
     while (insert_idx > 0 && best_errors[insert_idx - 1] > error) {
       if (insert_idx < kMaxCudaSourceImages) {
         best_errors[insert_idx] = best_errors[insert_idx - 1];
@@ -1546,22 +1570,124 @@ __device__ float ComputeRobustGeometricConsensusCost(
     if (insert_idx < kMaxCudaSourceImages) {
       best_errors[insert_idx] = error;
     }
-    num_valid = min(num_valid + 1, kMaxCudaSourceImages);
+    num_errors = min(num_errors + 1, kMaxCudaSourceImages);
   }
-  if (num_valid == 0) {
+  if (num_errors == 0) {
     return 0.5F * options.cost.geometric_consistency_weight *
            options.cost.geometric_max_reprojection_error;
   }
 
-  // The lower half rejects occluded/conflicting source depths while requiring
-  // broader agreement than the photometric best-three source ranking.
-  const int num_used = max(1, (num_valid + 1) / 2);
+  // Keep missing evidence in the support budget. The lower half can reject
+  // occluded/conflicting views without treating a lone match as consensus.
+  const int num_used = max(1, (num_errors + 1) / 2);
   float total = 0.0F;
   for (int i = 0; i < num_used; ++i) {
     total += best_errors[i];
   }
   return 0.5F * options.cost.geometric_consistency_weight *
          total / static_cast<float>(num_used);
+}
+
+struct DeviceSourceSamples {
+  int multiplicities[kMaxCudaSourceImages] = {};
+  int count = 0;
+};
+
+__device__ DeviceSourceSamples SampleSources(
+    cudaTextureObject_t poses_texture,
+    cudaTextureObject_t selection_texture,
+    const float* dynamic_probabilities,
+    const DevicePatchMatchOptions& options,
+    int col, int row, float depth, float3 normal) {
+  DeviceSourceSamples samples;
+  if (options.num_source_samples <= 0) return samples;
+  float weights[kMaxCudaSourceImages];
+  float max_weight = 0.0F;
+  for (int source = 0; source < options.num_sources; ++source) {
+    samples.multiplicities[source] = 0;
+    const float weight = GetSourceSelectionProbability(
+        poses_texture, selection_texture, dynamic_probabilities,
+        options.width * options.height, options.width, source, col, row) *
+        ComputeSourceGeometricPrior(poses_texture, options, source, col, row,
+                                    depth, normal);
+    weights[source] = isfinite(weight) ? fmaxf(0.0F, weight) : 0.0F;
+    max_weight = fmaxf(max_weight, weights[source]);
+  }
+  if (!(max_weight > 0.0F)) return samples;
+  // A CDF depends on relative weights. Low HMM confidence must not disable
+  // exploration solely because all otherwise valid weights share a small scale.
+  float total = 0.0F;
+  for (int source = 0; source < options.num_sources; ++source) {
+    weights[source] /= max_weight;
+    total += weights[source];
+  }
+  const std::uint32_t seed = 0xA511E9B3u ^ options.source_sampling_seed ^
+      (static_cast<std::uint32_t>(row + 1) * 2246822519u) ^
+      (static_cast<std::uint32_t>(col + 1) * 3266489917u);
+  for (int sample = 0; sample < options.num_source_samples; ++sample) {
+    const float target = Random01(seed + static_cast<std::uint32_t>(sample) *
+                                         668265263u) * total;
+    float cumulative = 0.0F;
+    int selected = -1;
+    for (int source = 0; source < options.num_sources; ++source) {
+      if (weights[source] <= 0.0F) continue;
+      selected = source;
+      cumulative += weights[source];
+      if (cumulative >= target) break;
+    }
+    if (selected >= 0) {
+      ++samples.multiplicities[selected];
+      ++samples.count;
+    }
+  }
+  return samples;
+}
+
+__device__ bool ComputeSampledCost(
+    cudaTextureObject_t reference_texture,
+    cudaTextureObject_t source_images_texture,
+    cudaTextureObject_t source_depth_maps_texture,
+    cudaTextureObject_t poses_texture,
+    const float* shared_reference_tile, int shared_reference_start_idx,
+    int shared_reference_num_pixels, const DeviceSourceImage* source_images,
+    DevicePatchMatchOptions options, int col, int row, float depth,
+    float3 normal, const DeviceSourceSamples& samples, float* cost,
+    DeviceCounters* counters) {
+  const float invalid_penalty = 1.0F +
+      (!options.cost.robust_geometric_aggregation
+           ? 0.5F * options.cost.geometric_consistency_weight *
+                 options.cost.geometric_max_reprojection_error
+           : 0.0F);
+  *cost = invalid_penalty;
+  if (samples.count == 0) return false;
+  // Keep invalidity distinct from valid costs above one after regularization.
+  options.cost.invalid_cost = 1e20F;
+  float total = 0.0F;
+  int valid_sources = 0;
+  for (int source = 0; source < options.num_sources; ++source) {
+    if (samples.multiplicities[source] == 0) continue;
+    if (counters != nullptr) {
+      atomicAdd(&counters->source_selection_tests, 1ULL);
+      atomicAdd(&counters->source_selection_acceptances, 1ULL);
+    }
+    float best = options.cost.invalid_cost;
+    for (int variant = 0; variant < options.num_pose_variants; ++variant) {
+      const float value = ComputeSourceCostForVariant(
+          reference_texture, source_images_texture, source_depth_maps_texture,
+          poses_texture, shared_reference_tile, shared_reference_start_idx,
+          shared_reference_num_pixels, source_images, options, source, variant,
+          col, row, depth, normal, !options.cost.robust_geometric_aggregation);
+      if (isfinite(value) && value < best) best = value;
+    }
+    const bool valid = best < options.cost.invalid_cost;
+    valid_sources += valid;
+    total += samples.multiplicities[source] * (valid ? best : invalid_penalty);
+  }
+  *cost = total / static_cast<float>(samples.count) +
+      ComputeRobustGeometricConsensusCost(
+          poses_texture, source_depth_maps_texture, source_images, options,
+          col, row, depth, normal);
+  return valid_sources >= options.cost.min_num_valid_sources;
 }
 
 __device__ bool ComputeAggregatedCost(cudaTextureObject_t reference_texture,
@@ -1580,10 +1706,25 @@ __device__ bool ComputeAggregatedCost(cudaTextureObject_t reference_texture,
                                       float depth,
                                       float3 normal,
                                       float* aggregated_cost,
-                                      DeviceCounters* counters) {
+                                      DeviceCounters* counters,
+                                      const DeviceSourceSamples* fixed_samples = nullptr) {
+  if (options.num_source_samples > 0) {
+    if (fixed_samples != nullptr) {
+      return ComputeSampledCost(reference_texture, source_images_texture,
+          source_depth_maps_texture, poses_texture, shared_reference_tile,
+          shared_reference_start_idx, shared_reference_num_pixels, source_images,
+          options, col, row, depth, normal, *fixed_samples, aggregated_cost,
+          counters);
+    }
+    const DeviceSourceSamples samples = SampleSources(poses_texture,
+        selection_texture, dynamic_probabilities, options, col, row, depth,
+        normal);
+    return ComputeSampledCost(reference_texture, source_images_texture,
+        source_depth_maps_texture, poses_texture, shared_reference_tile,
+        shared_reference_start_idx, shared_reference_num_pixels, source_images,
+        options, col, row, depth, normal, samples, aggregated_cost, counters);
+  }
   float best_costs[kMaxCudaSourceImages];
-  float valid_costs[kMaxCudaSourceImages];
-  float valid_weights[kMaxCudaSourceImages];
   int num_valid = 0;
   for (int source_idx = 0; source_idx < options.num_sources; ++source_idx) {
     const float source_cost = ComputeSourceCost(
@@ -1595,12 +1736,6 @@ __device__ bool ComputeAggregatedCost(cudaTextureObject_t reference_texture,
     if (!isfinite(source_cost) || source_cost >= options.cost.invalid_cost) {
       continue;
     }
-    valid_costs[num_valid] = source_cost;
-    valid_weights[num_valid] = GetSourceSelectionProbability(
-        poses_texture, selection_texture, dynamic_probabilities,
-        options.width * options.height, options.width, source_idx, col, row);
-    valid_weights[num_valid] *= ComputeSourceGeometricPrior(
-        poses_texture, options, source_idx, col, row, depth, normal);
     int insert_idx = num_valid;
     while (insert_idx > 0 && best_costs[insert_idx - 1] > source_cost) {
       if (insert_idx < kMaxCudaSourceImages) {
@@ -1617,41 +1752,6 @@ __device__ bool ComputeAggregatedCost(cudaTextureObject_t reference_texture,
     *aggregated_cost = options.cost.invalid_cost;
     return false;
   }
-  if (options.num_source_samples > 0) {
-    float weight_sum = 0.0F;
-    for (int i = 0; i < num_valid; ++i) {
-      weight_sum += fmaxf(0.0F, valid_weights[i]);
-    }
-    if (isfinite(weight_sum) && weight_sum > 1e-8F) {
-      float sampled_total = 0.0F;
-      const std::uint32_t base_seed =
-          0xA511E9B3u ^
-          (static_cast<std::uint32_t>(row + 1) * 2246822519u) ^
-          (static_cast<std::uint32_t>(col + 1) * 3266489917u);
-      for (int sample = 0; sample < options.num_source_samples; ++sample) {
-        const float target =
-            Random01(base_seed + static_cast<std::uint32_t>(sample) *
-                                     668265263u) *
-            weight_sum;
-        float cumulative = 0.0F;
-        int selected = num_valid - 1;
-        for (int i = 0; i < num_valid; ++i) {
-          cumulative += fmaxf(0.0F, valid_weights[i]);
-          if (cumulative >= target) {
-            selected = i;
-            break;
-          }
-        }
-        sampled_total += valid_costs[selected];
-      }
-      *aggregated_cost =
-          sampled_total / static_cast<float>(options.num_source_samples);
-      *aggregated_cost += ComputeRobustGeometricConsensusCost(
-          poses_texture, source_depth_maps_texture, source_images, options,
-          col, row, depth);
-      return true;
-    }
-  }
   const int num_used =
       options.cost.max_num_aggregated_costs <= 0
           ? num_valid
@@ -1663,19 +1763,12 @@ __device__ bool ComputeAggregatedCost(cudaTextureObject_t reference_texture,
   *aggregated_cost = total / static_cast<float>(num_used);
   *aggregated_cost += ComputeRobustGeometricConsensusCost(
       poses_texture, source_depth_maps_texture, source_images, options, col,
-      row, depth);
+      row, depth, normal);
   return true;
 }
 
 __device__ float ComputeNccLikelihood(float colite_cost, float ncc_sigma) {
-  constexpr float kPi = 3.14159265358979323846F;
-  const float colmap_cost = 2.0F * Clamp(colite_cost, 0.0F, 1.0F);
-  const float normalization =
-      2.0F /
-      (sqrtf(2.0F * kPi) * ncc_sigma *
-       erff(2.0F / (ncc_sigma * sqrtf(2.0F))));
-  return expf(-0.5F * colmap_cost * colmap_cost /
-              (ncc_sigma * ncc_sigma)) * normalization;
+  return detail::NccLikelihood(2.0F * Clamp(colite_cost, 0.0F, 1.0F), ncc_sigma);
 }
 
 __global__ void UpdateSelectionProbabilityKernel(
@@ -1706,7 +1799,10 @@ __global__ void UpdateSelectionProbabilityKernel(
                   normal_map[pixel_idx * 3 + 1],
                   normal_map[pixel_idx * 3 + 2]);
 
-  float best_cost = options.cost.invalid_cost;
+  options.cost.invalid_cost = 2.0F;
+  options.cost.source_weight_strength = 0;
+  options.cost.incident_angle_weight = 0;
+  float best_cost = 2.0F;
   if (IsFinitePositive(depth)) {
     for (int variant_idx = 0; variant_idx < options.num_pose_variants;
          ++variant_idx) {
@@ -1714,7 +1810,7 @@ __global__ void UpdateSelectionProbabilityKernel(
           reference_texture, source_images_texture, source_depth_maps_texture,
           poses_texture, nullptr, 0, 0, source_images, options, source_idx,
           variant_idx, col, row, depth, normal,
-          !options.cost.robust_geometric_aggregation);
+          false);
       if (isfinite(cost) && cost < best_cost) {
         best_cost = cost;
       }
@@ -1737,7 +1833,7 @@ __global__ void UpdateSelectionProbabilityKernel(
       options.min_selection_probability,
       options.max_selection_probability);
   if (options.directional_hmm && emissions != nullptr) {
-    emissions[idx] = emission;
+    emissions[idx] = best_cost < 2.0F ? emission : -emission;
   } else {
     dynamic_probabilities[idx] = updated;
   }
@@ -1749,50 +1845,19 @@ __global__ void UpdateSelectionProbabilityKernel(
 }
 
 __device__ float HmmForwardMessage(float emission, float previous) {
-  constexpr float kUniformProbability = 0.5F;
-  constexpr float kNoChangeProbability = 0.99999F;
-  constexpr float kChangeProbability = 1.0F - kNoChangeProbability;
-  const float rejected =
-      (previous * kChangeProbability +
-       (1.0F - previous) * kNoChangeProbability) *
-      kUniformProbability;
-  const float selected =
-      (previous * kNoChangeProbability +
-       (1.0F - previous) * kChangeProbability) *
-      emission;
-  const float denominator = rejected + selected;
-  return denominator > 1e-12F ? selected / denominator
-                              : kUniformProbability;
+  return detail::HmmForward(emission, previous);
 }
 
 __device__ float HmmBackwardMessage(float emission, float previous) {
-  constexpr float kUniformProbability = 0.5F;
-  constexpr float kNoChangeProbability = 0.99999F;
-  constexpr float kChangeProbability = 1.0F - kNoChangeProbability;
-  const float rejected = previous * emission * kChangeProbability +
-                         (1.0F - previous) * kUniformProbability *
-                             kNoChangeProbability;
-  const float selected = previous * emission * kNoChangeProbability +
-                         (1.0F - previous) * kUniformProbability *
-                             kChangeProbability;
-  const float denominator = rejected + selected;
-  return denominator > 1e-12F ? selected / denominator
-                              : kUniformProbability;
+  return detail::HmmBackward(emission, previous);
 }
 
 __device__ float HmmSelectionProbability(float alpha,
                                          float beta,
                                          float previous,
                                          DevicePatchMatchOptions options) {
-  const float rejected = (1.0F - alpha) * (1.0F - beta);
-  const float selected = alpha * beta;
-  const float denominator = rejected + selected;
-  const float current = denominator > 1e-12F ? selected / denominator : 0.5F;
-  return Clamp(options.previous_selection_probability_weight * previous +
-                   (1.0F - options.previous_selection_probability_weight) *
-                       current,
-               options.min_selection_probability,
-               options.max_selection_probability);
+  return detail::HmmSelection(alpha, beta, previous,
+                              options.previous_selection_probability_weight);
 }
 
 __global__ void DirectionalHmmRowsKernel(
@@ -1954,7 +2019,17 @@ __global__ void PackOutputMapsKernel(const float* depth_map,
                                      const float* normal_map,
                                      const float* cost_map,
                                      DeviceOutputPixel* output_pixels,
-                                     int num_pixels) {
+                                     int num_pixels,
+                                     cudaTextureObject_t reference_texture,
+                                     cudaTextureObject_t source_images_texture,
+                                     cudaTextureObject_t source_depth_maps_texture,
+                                     cudaTextureObject_t poses_texture,
+                                     const DeviceSourceImage* source_images,
+                                     DevicePatchMatchOptions options,
+                                     PatchMatchFilterOptions filter,
+                                     const float* probabilities,
+                                     const float* emissions,
+                                     float min_ncc_probability) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= num_pixels) {
     return;
@@ -1970,6 +2045,48 @@ __global__ void PackOutputMapsKernel(const float* depth_map,
   output.normal_y = normal.y;
   output.normal_z = normal.z;
   output.cost = cost_map[idx];
+  if (filter.enabled && IsFinitePositive(output.depth)) {
+    const int row = idx / options.width;
+    const int col = idx - row * options.width;
+    const auto& camera = options.reference_camera;
+    const float3 point = make_float3((col - camera.cx) / camera.fx * output.depth,
+        (row - camera.cy) / camera.fy * output.depth, output.depth);
+    float3 facing_normal = normal;
+    if (Dot3(facing_normal, point) > 0.0F) {
+      facing_normal = make_float3(-normal.x, -normal.y, -normal.z);
+    }
+    const float reference_norm = sqrtf(Dot3(point, point));
+    const float min_cosine = cosf(filter.min_triangulation_angle_degrees *
+                                 3.14159265358979323846F / 180.0F);
+    for (int source = 0; source < options.num_sources; ++source) {
+      const int probability_index = source * num_pixels + idx;
+      if (signbit(emissions[probability_index]) ||
+          !(probabilities[probability_index] >= min_ncc_probability)) continue;
+      const float3 ray = make_float3(
+          ReadPose(poses_texture, source, 0, kPoseCOffset) - point.x,
+          ReadPose(poses_texture, source, 0, kPoseCOffset + 1) - point.y,
+          ReadPose(poses_texture, source, 0, kPoseCOffset + 2) - point.z);
+      const float source_norm = sqrtf(Dot3(ray, ray));
+      if (!(source_norm > 0.0F && reference_norm > 0.0F) ||
+          -Dot3(point, ray) / (reference_norm * source_norm) > min_cosine ||
+          Dot3(facing_normal, ray) <= 0.0F) continue;
+      if (source_depth_maps_texture != 0) {
+        float relative_error = 0.0F;
+        float reprojection_error = 0.0F;
+        if (!ComputeSourceDepthRoundTripErrors(options, poses_texture,
+              source_depth_maps_texture, source_images[source], source, col, row,
+              output.depth, &relative_error, &reprojection_error) ||
+            reprojection_error > filter.geom_consistency_max_cost) continue;
+      }
+      output.source_mask |= std::uint32_t{1} << source;
+    }
+    if (static_cast<std::size_t>(__popc(output.source_mask)) < filter.min_num_consistent) {
+      output.depth = 0.0F;
+      output.normal_x = output.normal_y = output.normal_z = 0.0F;
+      output.cost = __int_as_float(0x7f800000);
+      output.source_mask = 0;
+    }
+  }
   output_pixels[idx] = output;
 }
 
@@ -2055,6 +2172,33 @@ __device__ bool ProjectNeighborPlaneDepthToPixel(
   return IsFinitePositive(*target_depth);
 }
 
+// Freeze the source draw for one pixel update and score its incumbent under
+// that same draw. Candidate projection failures must not alter the draw.
+__device__ DeviceSourceSamples PrepareSourceSamples(
+    cudaTextureObject_t reference_texture,
+    cudaTextureObject_t source_images_texture,
+    cudaTextureObject_t source_depth_maps_texture,
+    cudaTextureObject_t poses_texture,
+    cudaTextureObject_t selection_texture,
+    const float* dynamic_probabilities, const DeviceSourceImage* source_images,
+    float* depth_map, float* normal_map, float* cost_map,
+    const DevicePatchMatchOptions& options, int col, int row) {
+  const int idx = row * options.width + col;
+  const float depth = depth_map[idx];
+  const float3 normal = make_float3(normal_map[idx * 3],
+      normal_map[idx * 3 + 1], normal_map[idx * 3 + 2]);
+  const DeviceSourceSamples samples = SampleSources(
+      poses_texture, selection_texture, dynamic_probabilities, options,
+      col, row, depth, normal);
+  if (options.num_source_samples > 0) {
+    ComputeAggregatedCost(reference_texture, source_images_texture,
+        source_depth_maps_texture, poses_texture, selection_texture,
+        dynamic_probabilities, nullptr, 0, 0, source_images, options,
+        col, row, depth, normal, &cost_map[idx], nullptr, &samples);
+  }
+  return samples;
+}
+
 __device__ void TryUpdateFromNeighbor(cudaTextureObject_t reference_texture,
                                       cudaTextureObject_t source_images_texture,
                                       cudaTextureObject_t source_depth_maps_texture,
@@ -2070,7 +2214,8 @@ __device__ void TryUpdateFromNeighbor(cudaTextureObject_t reference_texture,
                                       int col,
                                       int neighbor_row,
                                       int neighbor_col,
-                                      DeviceCounters* counters) {
+                                      DeviceCounters* counters,
+                                      const DeviceSourceSamples* samples) {
   if (neighbor_row < 0 || neighbor_row >= options.height || neighbor_col < 0 ||
       neighbor_col >= options.width) {
     return;
@@ -2106,7 +2251,8 @@ __device__ void TryUpdateFromNeighbor(cudaTextureObject_t reference_texture,
                              selection_texture, dynamic_probabilities, nullptr,
                              0, 0, source_images,
                              options, col, row, candidate_depth,
-                             candidate_normal, &candidate_cost, counters)) {
+                             candidate_normal, &candidate_cost, counters,
+                             samples)) {
     return;
   }
   const float current_cost = cost_map[idx];
@@ -2142,30 +2288,34 @@ __global__ void PropagationKernel(cudaTextureObject_t reference_texture,
   }
   const int row = idx / options.width;
   const int col = idx - row * options.width;
+  const auto samples = PrepareSourceSamples(reference_texture,
+      source_images_texture, source_depth_maps_texture, poses_texture,
+      selection_texture, dynamic_probabilities, source_images, depth_map,
+      normal_map, cost_map, options, col, row);
   if (direction == 0) {
     TryUpdateFromNeighbor(reference_texture, source_images_texture,
                           source_depth_maps_texture, poses_texture,
                           selection_texture, dynamic_probabilities,
                           source_images, depth_map, normal_map, cost_map,
-                          options, row, col, row, col - 1, counters);
+                          options, row, col, row, col - 1, counters, &samples);
   } else if (direction == 1) {
     TryUpdateFromNeighbor(reference_texture, source_images_texture,
                           source_depth_maps_texture, poses_texture,
                           selection_texture, dynamic_probabilities,
                           source_images, depth_map, normal_map, cost_map,
-                          options, row, col, row, col + 1, counters);
+                          options, row, col, row, col + 1, counters, &samples);
   } else if (direction == 2) {
     TryUpdateFromNeighbor(reference_texture, source_images_texture,
                           source_depth_maps_texture, poses_texture,
                           selection_texture, dynamic_probabilities,
                           source_images, depth_map, normal_map, cost_map,
-                          options, row, col, row - 1, col, counters);
+                          options, row, col, row - 1, col, counters, &samples);
   } else {
     TryUpdateFromNeighbor(reference_texture, source_images_texture,
                           source_depth_maps_texture, poses_texture,
                           selection_texture, dynamic_probabilities,
                           source_images, depth_map, normal_map, cost_map,
-                          options, row, col, row + 1, col, counters);
+                          options, row, col, row + 1, col, counters, &samples);
   }
 }
 
@@ -2193,6 +2343,10 @@ __global__ void CheckerboardPropagationKernel(
   if (((row + col) & 1) != parity) {
     return;
   }
+  const auto samples = PrepareSourceSamples(reference_texture,
+      source_images_texture, source_depth_maps_texture, poses_texture,
+      selection_texture, dynamic_probabilities, source_images, depth_map,
+      normal_map, cost_map, options, col, row);
   const int neighbor_rows[4] = {row, row, row - 1, row + 1};
   const int neighbor_cols[4] = {col - 1, col + 1, col, col};
   // Photometric evaluation dominates checkerboard propagation. Neighbor cost
@@ -2248,7 +2402,8 @@ __global__ void CheckerboardPropagationKernel(
         reference_texture, source_images_texture, source_depth_maps_texture,
         poses_texture, selection_texture, dynamic_probabilities, source_images,
         depth_map, normal_map, cost_map, options, row, col,
-        neighbor_rows[best_neighbor], neighbor_cols[best_neighbor], counters);
+        neighbor_rows[best_neighbor], neighbor_cols[best_neighbor], counters,
+        &samples);
   }
 }
 
@@ -2269,7 +2424,8 @@ __device__ void TryUpdatePerturbationCandidate(
     float* best_depth,
     float3* best_normal,
     float* best_cost,
-    bool* updated) {
+    bool* updated,
+    const DeviceSourceSamples* samples) {
   if (counters != nullptr) {
     atomicAdd(&counters->candidate_evaluations, 1ULL);
     atomicAdd(&counters->perturbation_candidate_evaluations, 1ULL);
@@ -2285,7 +2441,7 @@ __device__ void TryUpdatePerturbationCandidate(
           poses_texture, selection_texture, dynamic_probabilities, nullptr, 0,
           0, source_images,
           options, col, row, candidate_depth, candidate_normal,
-          &candidate_cost, counters)) {
+          &candidate_cost, counters, samples)) {
     return;
   }
   if (candidate_cost < *best_cost) {
@@ -2331,6 +2487,10 @@ __global__ void PerturbationKernel(cudaTextureObject_t reference_texture,
                  make_float3(0.0F, 0.0F, 1.0F));
   float best_depth = current_depth;
   float3 best_normal = current_normal;
+  const auto samples = PrepareSourceSamples(reference_texture,
+      source_images_texture, source_depth_maps_texture, poses_texture,
+      selection_texture, dynamic_probabilities, source_images, depth_map,
+      normal_map, cost_map, options, col, row);
   float best_cost = cost_map[idx];
   bool updated = false;
   const float depth_radius = iteration_depth_radii[iteration_idx];
@@ -2353,19 +2513,19 @@ __global__ void PerturbationKernel(cudaTextureObject_t reference_texture,
         poses_texture, selection_texture, dynamic_probabilities, source_images,
         options, col, row,
         candidate_depth, candidate_normal, counters, &best_depth,
-        &best_normal, &best_cost, &updated);
+        &best_normal, &best_cost, &updated, &samples);
     TryUpdatePerturbationCandidate(
         reference_texture, source_images_texture, source_depth_maps_texture,
         poses_texture, selection_texture, dynamic_probabilities, source_images,
         options, col, row,
         current_depth, candidate_normal, counters, &best_depth, &best_normal,
-        &best_cost, &updated);
+        &best_cost, &updated, &samples);
     TryUpdatePerturbationCandidate(
         reference_texture, source_images_texture, source_depth_maps_texture,
         poses_texture, selection_texture, dynamic_probabilities, source_images,
         options, col, row,
         candidate_depth, current_normal, counters, &best_depth, &best_normal,
-        &best_cost, &updated);
+        &best_cost, &updated, &samples);
   }
   if (updated) {
     depth_map[idx] = best_depth;
@@ -2864,7 +3024,7 @@ void ValidateRequest(const CudaPatchMatchRequest& request) {
       request.options.cost.sigma_color <= 0.0F ||
       !std::isfinite(
           request.options.cost.geometric_max_reprojection_error) ||
-      request.options.cost.geometric_max_reprojection_error <= 0.0F ||
+      request.options.cost.geometric_max_reprojection_error < 0.0F ||
       request.options.cost.min_num_valid_sources == 0 ||
       request.options.perturbation.num_samples_per_pixel == 0) {
     throw std::invalid_argument("CUDA PatchMatch options are invalid.");
@@ -3069,6 +3229,9 @@ void AccumulateCudaSummary(PatchMatchStereoSummary* accumulated,
       level.iteration_source_selection_probability_means.end());
   accumulated->final_source_selection_probability_means =
       level.final_source_selection_probability_means;
+  accumulated->selection_history_weights.insert(
+      accumulated->selection_history_weights.end(),
+      level.selection_history_weights.begin(), level.selection_history_weights.end());
 }
 
 std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
@@ -3238,7 +3401,7 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
 
     const bool use_source_depth_maps =
         has_source_depth_maps &&
-        request.options.cost.geometric_consistency_weight > 0.0F;
+        (request.options.cost.geometric_consistency_weight > 0.0F || request.options.filter.enabled);
     const bool use_selection_probability_maps =
         request.source_selection_probability_maps != nullptr &&
         !request.source_selection_probability_maps->empty();
@@ -3320,7 +3483,7 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
                   *request.source_depth_maps, max_source_width,
                   max_source_height, staging);
             }
-          }));
+          }, cudaFilterModePoint));
     }
     if (use_selection_probability_maps) {
       record_texture_upload(upload_texture(
@@ -3378,21 +3541,28 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
         workspace_storage.host_depth_upload;
     PinnedHostBuffer<float>& h_normal_upload =
         workspace_storage.host_normal_upload;
+    const bool final_gpu_hmm = request.options.filter.enabled &&
+        !request.options.normal_refinement.enabled;
+    const bool probability_storage = request.options.source_selection.dynamic_probability || final_gpu_hmm;
+    const bool hmm_storage = final_gpu_hmm ||
+        (request.options.source_selection.dynamic_probability && request.options.source_selection.directional_hmm);
+    const bool cpu_filter_history = request.options.filter.enabled && request.options.normal_refinement.enabled &&
+        request.options.source_selection.dynamic_probability && request.options.source_selection.directional_hmm;
     record_buffer_resize(d_source_images_info.Resize(source_images_info.size()));
     record_buffer_resize(d_depth_map.Resize(num_pixels));
     record_buffer_resize(d_normal_map.Resize(num_pixels * 3));
     record_buffer_resize(d_cost_map.Resize(num_pixels));
-    if (request.options.source_selection.dynamic_probability) {
+    if (probability_storage) {
       record_buffer_resize(d_dynamic_selection_probability_map.Resize(
           num_source_pixels));
-      if (request.options.source_selection.directional_hmm) {
+      if (hmm_storage) {
         record_buffer_resize(d_source_selection_emission_map.Resize(
             num_source_pixels));
         record_buffer_resize(d_source_selection_backward_message_map.Resize(
             num_source_pixels));
       }
       if (use_selection_probability_maps ||
-          request.options.collect_diagnostics) {
+          request.options.collect_diagnostics || cpu_filter_history) {
         h_dynamic_selection_probability_map.Resize(num_source_pixels);
       } else {
         h_dynamic_selection_probability_map.Resize(0);
@@ -3424,7 +3594,7 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     cuda_pinned_host_staging_bytes +=
         sizeof(float) * h_dynamic_selection_probability_map.size();
     d_source_images_info.CopyFromHost(source_images_info);
-    if (request.options.source_selection.dynamic_probability) {
+    if (probability_storage) {
       if (use_selection_probability_maps) {
         PackSelectionProbabilityMapsToBuffer(
             *request.source_selection_probability_maps, width, height,
@@ -3434,13 +3604,13 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
         ++cuda_async_host_uploads;
         cuda_pinned_host_upload_bytes +=
             sizeof(float) * h_dynamic_selection_probability_map.size();
-      } else if (request.options.collect_diagnostics) {
+      } else if (request.options.collect_diagnostics || cpu_filter_history) {
         std::fill(
             h_dynamic_selection_probability_map.data(),
             h_dynamic_selection_probability_map.data() + num_source_pixels,
-            std::clamp(0.5F,
+            (hmm_storage ? 0.5F : std::clamp(0.5F,
                        request.options.source_selection.min_probability,
-                       request.options.source_selection.max_probability));
+                       request.options.source_selection.max_probability)));
         d_dynamic_selection_probability_map.CopyFromHostAsync(
             h_dynamic_selection_probability_map.data(), stream);
         ++cuda_async_host_uploads;
@@ -3452,9 +3622,9 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
         FillFloatBufferKernel<<<probability_blocks, kThreadsPerBlock, 0,
                                 stream>>>(
             d_dynamic_selection_probability_map.get(), num_source_pixels,
-            std::clamp(0.5F,
+            (hmm_storage ? 0.5F : std::clamp(0.5F,
                        request.options.source_selection.min_probability,
-                       request.options.source_selection.max_probability));
+                       request.options.source_selection.max_probability)));
         ++cuda_stream_kernel_launches;
         CudaCheck(cudaGetLastError());
       }
@@ -3536,6 +3706,24 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     perturbation_timers.reserve(request.options.num_iterations);
     iteration_depth_radii.reserve(request.options.num_iterations);
     iteration_normal_radii.reserve(request.options.num_iterations);
+    const int search_threads = device_options.num_source_samples > 0
+        ? kSearchThreadsPerBlock : kThreadsPerBlock;
+    const int search_blocks = static_cast<int>(
+        (num_pixels + search_threads - 1) / search_threads);
+    std::uint32_t sampling_step = 0;
+    std::size_t history_step = 0;
+    std::vector<float> history_weights;
+    const std::size_t history_steps_per_iteration =
+        request.options.propagation_schedule == PatchMatchPropagationSchedule::kCheckerboard
+            ? request.options.checkerboard_propagation_rounds
+            : (request.options.propagation_schedule == PatchMatchPropagationSchedule::kFourDirection ? 4 : 2);
+    const auto next_sampling_options = [&]() {
+      auto sampled_options = device_options;
+      sampled_options.source_sampling_seed =
+          request.options.initialization.random_seed ^
+          (++sampling_step * 668265263u);
+      return sampled_options;
+    };
     for (std::size_t iteration = 0; iteration < request.options.num_iterations;
          ++iteration) {
       DeviceCounters* const active_counters =
@@ -3545,86 +3733,19 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
         ++cuda_stream_kernel_launches;
         CudaCheck(cudaGetLastError());
       }
-      const auto run_direction = [&](int direction) {
-        PropagationKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
-            reference_texture.get(), source_images_texture.get(),
-            use_source_depth_maps ? source_depth_maps_texture.get() : 0,
-            poses_texture.get(),
-            use_selection_probability_maps ? selection_probability_texture.get()
-                                           : 0,
-            dynamic_selection_probabilities_ptr,
-            d_source_images_info.get(),
-            d_depth_map.get(), d_normal_map.get(), d_cost_map.get(),
-            device_options, direction, active_counters);
-        ++cuda_stream_kernel_launches;
-        CudaCheck(cudaGetLastError());
-      };
-      const auto run_checkerboard = [&](int parity) {
-        CheckerboardPropagationKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
-            reference_texture.get(), source_images_texture.get(),
-            use_source_depth_maps ? source_depth_maps_texture.get() : 0,
-            poses_texture.get(),
-            use_selection_probability_maps ? selection_probability_texture.get()
-                                           : 0,
-            dynamic_selection_probabilities_ptr,
-            d_source_images_info.get(), d_depth_map.get(), d_normal_map.get(),
-            d_cost_map.get(), device_options, parity, active_counters);
-        ++cuda_stream_kernel_launches;
-        CudaCheck(cudaGetLastError());
-      };
-
-      propagation_timers.emplace_back();
-      propagation_timers.back().Start(stream);
-      switch (request.options.propagation_schedule) {
-        case PatchMatchPropagationSchedule::kForwardBackward:
-          run_direction(0);
-          run_direction(1);
-          break;
-        case PatchMatchPropagationSchedule::kFourDirection:
-          run_direction(0);
-          run_direction(1);
-          run_direction(2);
-          run_direction(3);
-          break;
-        case PatchMatchPropagationSchedule::kCheckerboard:
-          for (std::size_t round = 0;
-               round < request.options.checkerboard_propagation_rounds;
-               ++round) {
-            run_checkerboard(0);
-            run_checkerboard(1);
+      // Refresh view evidence between sweeps; the last refresh follows the
+      // random candidates, so a checkerboard round contributes one update.
+      const auto update_selection_probabilities = [&]() {
+        if (!request.options.source_selection.dynamic_probability) return;
+        if (request.options.source_selection.directional_hmm) {
+          if (request.options.source_selection.anneal_history) {
+            device_options.previous_selection_probability_weight =
+                detail::SelectionHistoryWeight(history_step,
+                    request.options.num_iterations * history_steps_per_iteration);
           }
-          break;
-      }
-      propagation_timers.back().Stop(stream);
-
-      StorePerturbationRadiiKernel<<<1, 1, 0, stream>>>(
-          d_perturbation_radius_state.get(), d_iteration_depth_radii.get(),
-          d_iteration_normal_radii.get(), static_cast<int>(iteration),
-          request.options.min_depth_perturbation,
-          request.options.min_normal_radius_degrees);
-      ++cuda_stream_kernel_launches;
-      CudaCheck(cudaGetLastError());
-      perturbation_timers.emplace_back();
-      perturbation_timers.back().Start(stream);
-      PerturbationKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
-          reference_texture.get(), source_images_texture.get(),
-          use_source_depth_maps ? source_depth_maps_texture.get() : 0,
-          poses_texture.get(),
-          use_selection_probability_maps ? selection_probability_texture.get()
-                                         : 0,
-          dynamic_selection_probabilities_ptr,
-          d_source_images_info.get(), d_depth_map.get(),
-          d_normal_map.get(), d_cost_map.get(), device_options,
-          request.options.perturbation.random_seed +
-              static_cast<std::uint32_t>(iteration),
-          d_iteration_depth_radii.get(), d_iteration_normal_radii.get(),
-          static_cast<int>(iteration),
-          static_cast<int>(request.options.perturbation.num_samples_per_pixel),
-          active_counters);
-      ++cuda_stream_kernel_launches;
-      CudaCheck(cudaGetLastError());
-      perturbation_timers.back().Stop(stream);
-      if (request.options.source_selection.dynamic_probability) {
+          ++history_step;
+          history_weights.push_back(device_options.previous_selection_probability_weight);
+        }
         const std::size_t num_source_pixels =
             num_pixels * static_cast<std::size_t>(device_options.num_sources);
         const int probability_blocks = static_cast<int>(
@@ -3664,7 +3785,116 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
           ++cuda_stream_kernel_launches;
           CudaCheck(cudaGetLastError());
         }
+        // Updating source probabilities changes the objective, including the
+        // CDF samples. Refresh the current plane's cost before comparing new
+        // candidates or persisting the final cost map.
+        CudaEventTimer refresh_timer;
+        refresh_timer.Start(stream);
+        EvaluateCostKernel<<<blocks, kThreadsPerBlock,
+                             kThreadsPerBlock * sizeof(float), stream>>>(
+            reference_texture.get(), source_images_texture.get(),
+            use_source_depth_maps ? source_depth_maps_texture.get() : 0,
+            poses_texture.get(),
+            use_selection_probability_maps ? selection_probability_texture.get()
+                                           : 0,
+            dynamic_selection_probabilities_ptr,
+            d_source_images_info.get(), d_depth_map.get(), d_normal_map.get(),
+            d_cost_map.get(), device_options);
+        ++cuda_stream_kernel_launches;
+        CudaCheck(cudaGetLastError());
+        cuda_evaluate_cost_time_ms += refresh_timer.StopMilliseconds(stream);
+        cuda_shared_reference_tile_pixels += num_pixels;
+      };
+      const auto run_direction = [&](int direction) {
+        const auto sampled_options = next_sampling_options();
+        PropagationKernel<<<search_blocks, search_threads, 0, stream>>>(
+            reference_texture.get(), source_images_texture.get(),
+            use_source_depth_maps ? source_depth_maps_texture.get() : 0,
+            poses_texture.get(),
+            use_selection_probability_maps ? selection_probability_texture.get()
+                                           : 0,
+            dynamic_selection_probabilities_ptr,
+            d_source_images_info.get(),
+            d_depth_map.get(), d_normal_map.get(), d_cost_map.get(),
+            sampled_options, direction, active_counters);
+        ++cuda_stream_kernel_launches;
+        CudaCheck(cudaGetLastError());
+      };
+      const auto run_checkerboard = [&](int parity) {
+        const auto sampled_options = next_sampling_options();
+        CheckerboardPropagationKernel<<<search_blocks, search_threads, 0, stream>>>(
+            reference_texture.get(), source_images_texture.get(),
+            use_source_depth_maps ? source_depth_maps_texture.get() : 0,
+            poses_texture.get(),
+            use_selection_probability_maps ? selection_probability_texture.get()
+                                           : 0,
+            dynamic_selection_probabilities_ptr,
+            d_source_images_info.get(), d_depth_map.get(), d_normal_map.get(),
+            d_cost_map.get(), sampled_options, parity, active_counters);
+        ++cuda_stream_kernel_launches;
+        CudaCheck(cudaGetLastError());
+      };
+
+      propagation_timers.emplace_back();
+      propagation_timers.back().Start(stream);
+      switch (request.options.propagation_schedule) {
+        case PatchMatchPropagationSchedule::kForwardBackward:
+          run_direction(0);
+          update_selection_probabilities();
+          run_direction(1);
+          break;
+        case PatchMatchPropagationSchedule::kFourDirection:
+          run_direction(0);
+          update_selection_probabilities();
+          run_direction(1);
+          update_selection_probabilities();
+          run_direction(2);
+          update_selection_probabilities();
+          run_direction(3);
+          break;
+        case PatchMatchPropagationSchedule::kCheckerboard:
+          for (std::size_t round = 0;
+               round < request.options.checkerboard_propagation_rounds;
+               ++round) {
+            run_checkerboard(0);
+            run_checkerboard(1);
+            if (round + 1 < request.options.checkerboard_propagation_rounds) {
+              update_selection_probabilities();
+            }
+          }
+          break;
       }
+      propagation_timers.back().Stop(stream);
+
+      StorePerturbationRadiiKernel<<<1, 1, 0, stream>>>(
+          d_perturbation_radius_state.get(), d_iteration_depth_radii.get(),
+          d_iteration_normal_radii.get(), static_cast<int>(iteration),
+          request.options.min_depth_perturbation,
+          request.options.min_normal_radius_degrees);
+      ++cuda_stream_kernel_launches;
+      CudaCheck(cudaGetLastError());
+      perturbation_timers.emplace_back();
+      perturbation_timers.back().Start(stream);
+      const auto sampled_options = next_sampling_options();
+      PerturbationKernel<<<search_blocks, search_threads, 0, stream>>>(
+          reference_texture.get(), source_images_texture.get(),
+          use_source_depth_maps ? source_depth_maps_texture.get() : 0,
+          poses_texture.get(),
+          use_selection_probability_maps ? selection_probability_texture.get()
+                                         : 0,
+          dynamic_selection_probabilities_ptr,
+          d_source_images_info.get(), d_depth_map.get(),
+          d_normal_map.get(), d_cost_map.get(), sampled_options,
+          request.options.perturbation.random_seed +
+              static_cast<std::uint32_t>(iteration),
+          d_iteration_depth_radii.get(), d_iteration_normal_radii.get(),
+          static_cast<int>(iteration),
+          static_cast<int>(request.options.perturbation.num_samples_per_pixel),
+          active_counters);
+      ++cuda_stream_kernel_launches;
+      CudaCheck(cudaGetLastError());
+      perturbation_timers.back().Stop(stream);
+      update_selection_probabilities();
       if (active_counters != nullptr) {
         StoreIterationCountersKernel<<<1, 1, 0, stream>>>(
             active_counters, d_iteration_counters.get(),
@@ -3696,21 +3926,62 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
       d_iteration_normal_radii.CopyToHostAsync(h_iteration_normal_radii.data(),
                                                stream);
     }
+    if (final_gpu_hmm && !(request.options.num_iterations > 0 &&
+        request.options.source_selection.dynamic_probability && request.options.source_selection.directional_hmm)) {
+      auto inference_options = device_options;
+      inference_options.directional_hmm = true;
+      // Non-HMM Bayesian history is not an HMM prior. Restart from the
+      // configured prior (or 0.5), matching the CPU final-inference path.
+      if (request.options.num_iterations > 0 && request.options.source_selection.dynamic_probability &&
+          !request.options.source_selection.directional_hmm) {
+        if (use_selection_probability_maps) {
+          d_dynamic_selection_probability_map.CopyFromHostAsync(h_dynamic_selection_probability_map.data(), stream);
+          ++cuda_async_host_uploads;
+          cuda_pinned_host_upload_bytes += sizeof(float) * num_source_pixels;
+        } else {
+          const int fill_blocks = static_cast<int>((num_source_pixels + kThreadsPerBlock - 1) / kThreadsPerBlock);
+          FillFloatBufferKernel<<<fill_blocks, kThreadsPerBlock, 0, stream>>>(
+              d_dynamic_selection_probability_map.get(), num_source_pixels, 0.5F);
+          ++cuda_stream_kernel_launches;
+        }
+      }
+      const int probability_blocks = static_cast<int>((num_source_pixels + kThreadsPerBlock - 1) / kThreadsPerBlock);
+      UpdateSelectionProbabilityKernel<<<probability_blocks, kThreadsPerBlock, 0, stream>>>(
+          reference_texture.get(), source_images_texture.get(), 0, poses_texture.get(),
+          d_source_images_info.get(), d_depth_map.get(), d_normal_map.get(),
+          d_dynamic_selection_probability_map.get(), d_source_selection_emission_map.get(), inference_options, nullptr);
+      const int row_blocks = (device_options.num_sources * height + kThreadsPerBlock - 1) / kThreadsPerBlock;
+      const int col_blocks = (device_options.num_sources * width + kThreadsPerBlock - 1) / kThreadsPerBlock;
+      DirectionalHmmRowsKernel<<<row_blocks, kThreadsPerBlock, 0, stream>>>(
+          d_source_selection_emission_map.get(), d_source_selection_backward_message_map.get(),
+          d_dynamic_selection_probability_map.get(), inference_options);
+      DirectionalHmmColumnsKernel<<<col_blocks, kThreadsPerBlock, 0, stream>>>(
+          d_source_selection_emission_map.get(), d_source_selection_backward_message_map.get(),
+          d_dynamic_selection_probability_map.get(), inference_options);
+      cuda_stream_kernel_launches += 3;
+      CudaCheck(cudaGetLastError());
+    }
     PackOutputMapsKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
         d_depth_map.get(), d_normal_map.get(), d_cost_map.get(),
-        d_output_pixels.get(), static_cast<int>(num_pixels));
+        d_output_pixels.get(), static_cast<int>(num_pixels), reference_texture.get(),
+        source_images_texture.get(), use_source_depth_maps ? source_depth_maps_texture.get() : 0,
+        poses_texture.get(), d_source_images_info.get(), device_options,
+        request.options.normal_refinement.enabled ? PatchMatchFilterOptions{} : request.options.filter,
+        final_gpu_hmm ? d_dynamic_selection_probability_map.get() : nullptr,
+        final_gpu_hmm ? d_source_selection_emission_map.get() : nullptr,
+        detail::NccLikelihood(1.0F - request.options.filter.min_ncc, request.options.source_selection.ncc_sigma));
     ++cuda_stream_kernel_launches;
     CudaCheck(cudaGetLastError());
     d_output_pixels.CopyToHostAsync(h_output_pixels.data(), stream);
+    cuda_async_output_readbacks = h_output_pixels.size() == 0 ? 0 : 1;
     if (request.options.source_selection.dynamic_probability &&
-        request.options.collect_diagnostics) {
+        (request.options.collect_diagnostics || cpu_filter_history)) {
       d_dynamic_selection_probability_map.CopyToHostAsync(
           h_dynamic_selection_probability_map.data(), stream);
       ++cuda_async_output_readbacks;
     }
     cuda_packed_output_pixels = h_output_pixels.size();
     cuda_output_map_readbacks = h_output_pixels.size() == 0 ? 0 : 1;
-    cuda_async_output_readbacks = h_output_pixels.size() == 0 ? 0 : 1;
     CudaCheck(cudaStreamSynchronize(stream));
     for (CudaEventTimer& timer : propagation_timers) {
       cuda_propagation_time_ms += timer.ElapsedMilliseconds();
@@ -3760,6 +4031,20 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
               : Eigen::Vector3f::Zero();
       cost_values[idx] = output.cost;
     }
+    if (request.options.filter.enabled && !request.options.normal_refinement.enabled) {
+      std::vector<std::size_t> offsets(num_pixels + 1, 0);
+      std::vector<ImageId> ids;
+      for (std::size_t pixel = 0; pixel < num_pixels; ++pixel) {
+        offsets[pixel] = ids.size();
+        const auto mask = output_values[pixel].source_mask;
+        for (std::size_t source = 0; source < request.source_views->size(); ++source) {
+          if (mask & (std::uint32_t{1} << source)) ids.push_back(request.source_views->at(source).image_id);
+        }
+      }
+      offsets.back() = ids.size();
+      result.filter_graph = std::make_shared<ConsistencyGraph>(ConsistencyGraph::FromCompactData(
+          width, height, std::move(offsets), std::move(ids)));
+    }
     const double cuda_dense_map_fill_time_ms =
         ElapsedMilliseconds(dense_map_fill_start, SteadyClock::now());
 
@@ -3767,6 +4052,7 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     result.summary.actual_backend = PatchMatchBackend::kCuda;
     result.summary.num_pyramid_levels = 1;
     result.summary.num_iterations = request.options.num_iterations;
+    result.summary.selection_history_weights = std::move(history_weights);
     result.summary.cuda_upload_time_ms = cuda_upload_time_ms;
     result.summary.cuda_initialization_time_ms =
         cuda_initialization_time_ms;
@@ -3934,6 +4220,29 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
       result.summary.num_normal_refinement_skipped_pixels =
           refinement_summary.num_skipped_pixels;
     }
+    if (request.options.filter.enabled && request.options.normal_refinement.enabled) {
+      std::vector<const DenseDepthMap*> filter_depths;
+      if (request.source_depth_map_ptrs) filter_depths = *request.source_depth_map_ptrs;
+      else if (request.source_depth_maps) {
+        for (const auto& map : *request.source_depth_maps) filter_depths.push_back(&map);
+      }
+      std::vector<DenseCostMap> final_probabilities;
+      if (cpu_filter_history) {
+        for (std::size_t source = 0; source < request.source_views->size(); ++source) {
+          auto& map = final_probabilities.emplace_back(width, height);
+          std::copy_n(h_dynamic_selection_probability_map.data() + source * num_pixels,
+                      num_pixels, map.MutableData().data());
+        }
+        UpdatePatchMatchSelectionProbabilities(*request.reference_view, *request.source_views,
+            *request.reference_image, *request.source_images, result.depth_map, result.normal_map,
+            request.options.cost, request.options.source_selection, &final_probabilities);
+      }
+      FilterPatchMatchStereoResult(*request.reference_view, *request.source_views,
+          *request.reference_image, *request.source_images,
+          has_source_depth_maps ? &filter_depths : nullptr,
+          request.options.cost, request.options.filter, &result, request.options.source_selection,
+          final_probabilities.empty() ? nullptr : &final_probabilities);
+    }
     result.summary.cuda_normal_refinement_time_ms =
         ElapsedMilliseconds(normal_refinement_start, SteadyClock::now());
     const SteadyClock::time_point valid_cost_count_start =
@@ -4006,6 +4315,7 @@ double WarmupCudaPatchMatch(int cuda_gpu_index,
 std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereo(
     const CudaPatchMatchRequest& request,
     std::string* unavailable_reason) {
+  ValidatePatchMatchFilterOptions(request.options.filter);
   const SteadyClock::time_point wrapper_start = SteadyClock::now();
   if (request.options.pyramid_levels <= 1) {
     std::optional<PatchMatchStereoResult> result =
@@ -4192,6 +4502,7 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereo(
       level_request.depth_max = request.depth_max;
       level_request.options = request.options;
       level_request.options.pyramid_levels = 1;
+      level_request.options.filter.enabled = request.options.filter.enabled && level_idx + 1 == num_levels;
       level_request.options.initialization.random_seed +=
           static_cast<std::uint32_t>(level_idx * 101U);
       level_request.options.perturbation.random_seed +=

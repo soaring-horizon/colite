@@ -34,6 +34,27 @@ using DistanceMatrix =
     Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 using FlannIndex = flann::Index<flann::L2<std::uint8_t>>;
 
+void ValidateSiftFeatureSet(const FeatureSet& features,
+                            const FeatureMatcherType matcher_type) {
+  if (!IsFeatureMatcherCompatible(features.extractor_type, matcher_type)) {
+    throw std::invalid_argument(
+        "Feature extractor type is incompatible with matcher type.");
+  }
+  if (matcher_type != FeatureMatcherType::kSiftBruteForce ||
+      features.extractor_type != FeatureExtractorType::kSift ||
+      features.descriptor_scalar_type != DescriptorScalarType::kFloat32 ||
+      features.descriptor_metric != DescriptorMetric::kSiftAngular) {
+    throw std::invalid_argument(
+        "The selected matcher is not implemented for this descriptor contract.");
+  }
+  if (!features.keypoints.empty() && features.descriptors.size() != 0 &&
+      features.descriptors.rows() !=
+          static_cast<Eigen::Index>(features.keypoints.size())) {
+    throw std::invalid_argument(
+        "Feature keypoint and descriptor row counts do not match.");
+  }
+}
+
 std::uint8_t ClampToByte(const float value) {
   if (!std::isfinite(value) || value <= 0.0F) {
     return 0;
@@ -540,11 +561,19 @@ std::vector<int> BestMatches(const DescriptorByteMatrix& query_descriptors,
 
 struct PreparedFeatureMatcher::Impl {
   explicit Impl(const FeatureSet& features,
-                const DescriptorMatcherBackend matcher_backend)
-      : keypoints(features.keypoints),
+                const DescriptorMatcherBackend matcher_backend,
+                const FeatureMatcherType matcher_type)
+      : keypoints(matcher_backend == DescriptorMatcherBackend::kCudaBruteForce
+                      ? std::vector<FeatureKeypoint>{} : features.keypoints),
+        num_keypoints(features.keypoints.size()),
         descriptors(QuantizeDescriptors(features.descriptors)),
-        grid(BuildFeatureGrid(features)),
-        backend(matcher_backend) {
+        descriptor_rows(descriptors.rows()),
+        descriptor_cols(descriptors.cols()),
+        grid(matcher_backend == DescriptorMatcherBackend::kCudaBruteForce
+                 ? FeatureGrid{} : BuildFeatureGrid(features)),
+        backend(matcher_backend),
+        matcher_type(matcher_type) {
+    ValidateSiftFeatureSet(features, matcher_type);
     if (backend == DescriptorMatcherBackend::kFlann &&
         descriptors.size() != 0) {
       flann::Matrix<std::uint8_t> matrix(
@@ -557,35 +586,47 @@ struct PreparedFeatureMatcher::Impl {
     if (backend == DescriptorMatcherBackend::kCudaBruteForce &&
         descriptors.size() != 0) {
       std::vector<float> keypoints_xy;
-      keypoints_xy.reserve(keypoints.size() * 2);
-      for (const FeatureKeypoint& keypoint : keypoints) {
+      keypoints_xy.reserve(features.keypoints.size() * 2);
+      for (const FeatureKeypoint& keypoint : features.keypoints) {
         keypoints_xy.push_back(keypoint.x);
         keypoints_xy.push_back(keypoint.y);
       }
       cuda_buffer = cuda_matcher::CreateBuffer(
           descriptors.data(), static_cast<int>(descriptors.rows()),
           static_cast<int>(descriptors.cols()),
-          keypoints.size() == static_cast<std::size_t>(descriptors.rows())
+          num_keypoints == static_cast<std::size_t>(descriptors.rows())
               ? keypoints_xy.data()
               : nullptr);
+      // CUDA raw and guided matching use the uploaded descriptors/keypoints.
+      // Keep dimensions independently so validation does not require a second
+      // full copy of the byte descriptors on the host.
+      descriptors.resize(0, 0);
     }
   }
 
   std::vector<FeatureKeypoint> keypoints;
+  std::size_t num_keypoints;
   DescriptorByteMatrix descriptors;
+  Eigen::Index descriptor_rows;
+  Eigen::Index descriptor_cols;
   FeatureGrid grid;
   DescriptorMatcherBackend backend;
+  FeatureMatcherType matcher_type;
   std::unique_ptr<FlannIndex> index;
   std::unique_ptr<cuda_matcher::DescriptorBuffer> cuda_buffer;
   mutable std::mutex index_mutex;
+
+  bool Empty() const { return descriptor_rows == 0 || descriptor_cols == 0; }
 };
 
 PreparedFeatureMatcher::PreparedFeatureMatcher(
     const FeatureSet& features,
     const DescriptorMatcherBackend backend)
-    : impl_(std::make_unique<Impl>(features, backend)) {}
+    : impl_(std::make_unique<Impl>(features, backend,
+                                   FeatureMatcherType::kSiftBruteForce)) {}
 
 PreparedFeatureMatcher::~PreparedFeatureMatcher() = default;
+void ReleaseDescriptorMatcherWorkspace() { cuda_matcher::ReleaseWorkspace(); }
 PreparedFeatureMatcher::PreparedFeatureMatcher(
     PreparedFeatureMatcher&&) noexcept = default;
 PreparedFeatureMatcher& PreparedFeatureMatcher::operator=(
@@ -600,16 +641,19 @@ std::vector<FeatureMatch> MatchPreparedFeatureSets(
     throw std::invalid_argument(
         "Prepared matcher backend does not match matching options.");
   }
+  if (features1.impl_->matcher_type != options.matcher_type ||
+      features2.impl_->matcher_type != options.matcher_type) {
+    throw std::invalid_argument(
+        "Prepared matcher type does not match matching options.");
+  }
   if (options.max_ratio <= 0.0 || options.max_distance <= 0.0) {
     throw std::invalid_argument("Matching thresholds must be positive.");
   }
-  const auto& descriptors1 = features1.impl_->descriptors;
-  const auto& descriptors2 = features2.impl_->descriptors;
-  if (descriptors1.cols() != descriptors2.cols() &&
-      descriptors1.size() != 0 && descriptors2.size() != 0) {
+  if (features1.impl_->descriptor_cols != features2.impl_->descriptor_cols &&
+      !features1.impl_->Empty() && !features2.impl_->Empty()) {
     throw std::invalid_argument("Descriptor dimensions do not match.");
   }
-  if (descriptors1.size() == 0 || descriptors2.size() == 0) {
+  if (features1.impl_->Empty() || features2.impl_->Empty()) {
     return {};
   }
 
@@ -628,8 +672,7 @@ std::vector<FeatureMatch> MatchPreparedFeatureSets(
   std::vector<int> forward;
   std::vector<int> backward;
   if (options.backend == DescriptorMatcherBackend::kCudaBruteForce &&
-      options.mutual_check && descriptors1.rows() % 4 == 0 &&
-      descriptors2.rows() % 4 == 0) {
+      options.mutual_check) {
     const cuda_matcher::MutualBestMatches candidates =
         cuda_matcher::FindBestMatchesMutual(*features1.impl_->cuda_buffer,
                                             *features2.impl_->cuda_buffer);
@@ -671,15 +714,18 @@ std::vector<FeatureMatch> MatchPreparedFeatureSetsGuidedFundamental(
     throw std::invalid_argument(
         "Prepared matcher backend does not match guided matching options.");
   }
-  if (impl1.descriptors.rows() !=
-          static_cast<Eigen::Index>(impl1.keypoints.size()) ||
-      impl2.descriptors.rows() !=
-          static_cast<Eigen::Index>(impl2.keypoints.size()) ||
-      (impl1.descriptors.cols() != impl2.descriptors.cols() &&
-       impl1.descriptors.size() != 0 && impl2.descriptors.size() != 0)) {
+  if (impl1.matcher_type != options.matcher_type ||
+      impl2.matcher_type != options.matcher_type) {
+    throw std::invalid_argument(
+        "Prepared matcher type does not match guided matching options.");
+  }
+  if (impl1.descriptor_rows != static_cast<Eigen::Index>(impl1.num_keypoints) ||
+      impl2.descriptor_rows != static_cast<Eigen::Index>(impl2.num_keypoints) ||
+      (impl1.descriptor_cols != impl2.descriptor_cols &&
+       !impl1.Empty() && !impl2.Empty())) {
     return {};
   }
-  if (impl1.descriptors.size() == 0 || impl2.descriptors.size() == 0) {
+  if (impl1.Empty() || impl2.Empty()) {
     return {};
   }
   std::vector<int> forward;
@@ -745,12 +791,128 @@ std::vector<FeatureMatch> MatchPreparedFeatureSetsGuidedFundamental(
   return matches;
 }
 
+std::vector<FeatureMatch> MatchPreparedFeatureSetsGuidedGeometry(
+    const PreparedFeatureMatcher& features1,
+    const PreparedFeatureMatcher& features2,
+    const GuidedGeometryType type, const Eigen::Matrix3d& matrix,
+    const std::vector<Eigen::Vector2d>& coordinates1,
+    const std::vector<Eigen::Vector2d>& coordinates2,
+    const double max_error, const DescriptorMatchingOptions& options,
+    GuidedDescriptorMatchingStats* stats) {
+  if (!matrix.allFinite() || matrix.cwiseAbs().maxCoeff() <= 0 ||
+      !std::isfinite(max_error) || max_error < 0 ||
+      !std::isfinite(options.max_ratio) || options.max_ratio <= 0 ||
+      !std::isfinite(options.max_distance) || options.max_distance <= 0) return {};
+  const auto& a = *features1.impl_;
+  const auto& b = *features2.impl_;
+  if (a.backend != options.backend || b.backend != options.backend ||
+      a.matcher_type != options.matcher_type || b.matcher_type != options.matcher_type)
+    throw std::invalid_argument("Prepared matcher backend/type does not match guided options");
+  if (coordinates1.size() != static_cast<std::size_t>(a.descriptor_rows) ||
+      coordinates2.size() != static_cast<std::size_t>(b.descriptor_rows))
+    throw std::invalid_argument("Guided coordinates must preserve descriptor row indices");
+  if (a.Empty() || b.Empty()) return {};
+  if (a.descriptor_cols != b.descriptor_cols) return {};
+  if (coordinates1.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+      coordinates2.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    throw std::length_error("Too many guided feature coordinates");
+
+  const auto started = std::chrono::steady_clock::now();
+  const Eigen::Matrix3d model = matrix / matrix.cwiseAbs().maxCoeff();
+  const double limit = max_error * max_error;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  std::vector<Eigen::Vector3d> first_lines(coordinates1.size(), Eigen::Vector3d::Constant(nan));
+  std::vector<Eigen::Vector3d> second_lines(coordinates2.size(), Eigen::Vector3d::Constant(nan));
+  for (std::size_t i = 0; i < coordinates1.size(); ++i) {
+    if (coordinates1[i].allFinite()) first_lines[i] = model * Eigen::Vector3d(coordinates1[i].x(), coordinates1[i].y(), 1);
+  }
+  if (type == GuidedGeometryType::kEpipolar) {
+    for (std::size_t j = 0; j < coordinates2.size(); ++j) {
+      if (coordinates2[j].allFinite()) second_lines[j] = model.transpose() * Eigen::Vector3d(coordinates2[j].x(), coordinates2[j].y(), 1);
+    }
+  }
+  GuidedCandidateIndex forward_candidates, backward_candidates;
+  forward_candidates.offsets.resize(coordinates1.size() + 1, 0);
+  backward_candidates.offsets.resize(coordinates2.size() + 1, 0);
+  for (std::size_t i = 0; i < coordinates1.size(); ++i) {
+    const auto& line = first_lines[i];
+    if (line.allFinite() && (type != GuidedGeometryType::kHomography || line.z() != 0)) {
+      for (std::size_t j = 0; j < coordinates2.size(); ++j) {
+        if (!coordinates2[j].allFinite()) continue;
+        bool accepted = false;
+        if (type == GuidedGeometryType::kHomography) {
+          const Eigen::Vector2d projected = line.head<2>() / line.z();
+          const double error = (projected - coordinates2[j]).squaredNorm();
+          accepted = std::isfinite(error) && error <= limit;
+        } else {
+          const double denominator = line.head<2>().squaredNorm() + second_lines[j].head<2>().squaredNorm();
+          const double residual = coordinates2[j].x() * line.x() + coordinates2[j].y() * line.y() + line.z();
+          accepted = denominator > 0 && std::isfinite(denominator) && std::isfinite(residual) &&
+                     residual * residual <= limit * denominator;
+        }
+        if (accepted) {
+          if (forward_candidates.indices.size() >= static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            throw std::length_error("Too many guided descriptor candidates");
+          forward_candidates.indices.push_back(static_cast<int>(j));
+          if (options.mutual_check) ++backward_candidates.offsets[j + 1];
+        }
+      }
+    }
+    forward_candidates.offsets[i + 1] = static_cast<int>(forward_candidates.indices.size());
+  }
+  if (options.mutual_check) {
+    for (std::size_t j = 1; j < backward_candidates.offsets.size(); ++j)
+      backward_candidates.offsets[j] += backward_candidates.offsets[j - 1];
+    backward_candidates.indices.resize(forward_candidates.indices.size());
+    auto cursor = backward_candidates.offsets;
+    for (std::size_t i = 0; i < coordinates1.size(); ++i) {
+      for (int k = forward_candidates.offsets[i]; k < forward_candidates.offsets[i + 1]; ++k) {
+        const int j = forward_candidates.indices[k];
+        backward_candidates.indices[cursor[j]++] = static_cast<int>(i);
+      }
+    }
+  }
+  if (stats) stats->candidate_generation_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  const auto search_started = std::chrono::steady_clock::now();
+  std::vector<int> forward, backward;
+  if (options.backend == DescriptorMatcherBackend::kCudaBruteForce) {
+    forward = FilterCudaBestMatches(cuda_matcher::FindBestMatchesGuided(
+        *a.cuda_buffer, *b.cuda_buffer, forward_candidates.offsets, forward_candidates.indices), options);
+    if (options.mutual_check) backward = FilterCudaBestMatches(cuda_matcher::FindBestMatchesGuided(
+        *b.cuda_buffer, *a.cuda_buffer, backward_candidates.offsets, backward_candidates.indices), options);
+  } else {
+    forward = FindBestMatchesOneWayGuided(a.descriptors, b.descriptors, forward_candidates, options);
+    if (options.mutual_check) backward = FindBestMatchesOneWayGuided(b.descriptors, a.descriptors, backward_candidates, options);
+  }
+  if (stats) stats->descriptor_search_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - search_started).count();
+  std::vector<FeatureMatch> matches;
+  for (std::size_t i = 0; i < forward.size(); ++i) {
+    const int j = forward[i];
+    if (j >= 0 && (!options.mutual_check || backward[j] == static_cast<int>(i)))
+      matches.push_back({static_cast<Point2DIdx>(i), static_cast<Point2DIdx>(j)});
+  }
+  return matches;
+}
+
 bool IsCudaDescriptorMatcherAvailable() { return cuda_matcher::IsAvailable(); }
+void SetCudaDescriptorMatcherDevice(int device) {
+#if defined(COLITE_ENABLE_CUDA_MATCHER)
+  cuda_matcher::SetDevice(device);
+#else
+  (void)device;
+  throw std::runtime_error("CUDA matching is not enabled in this build");
+#endif
+}
 
 std::vector<FeatureMatch> MatchFeatureSets(
     const FeatureSet& features1,
     const FeatureSet& features2,
     const DescriptorMatchingOptions& options) {
+  ValidateSiftFeatureSet(features1, options.matcher_type);
+  ValidateSiftFeatureSet(features2, options.matcher_type);
+  if (features1.extractor_type != features2.extractor_type) {
+    throw std::invalid_argument("Feature extractor types do not match.");
+  }
   return MatchDescriptors(features1.descriptors, features2.descriptors, options);
 }
 

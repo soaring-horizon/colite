@@ -23,6 +23,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include "colite/core/geometry.h"
+#include "colite/core/parallel.h"
 
 namespace colite::mvs {
 namespace {
@@ -410,8 +411,8 @@ std::vector<int> SelectViews(const DenseTriangleMesh& mesh,
       process_view(view_id);
     }
   } else {
-    cv::parallel_for_(cv::Range(0, static_cast<int>(views.size())),
-                      [&](const cv::Range& range) {
+    parallel::parallel_for_(parallel::Range(0, static_cast<int>(views.size())),
+                      [&](const parallel::Range& range) {
       for (int view_id = range.start; view_id < range.end; ++view_id) {
         process_view(static_cast<std::size_t>(view_id));
       }
@@ -993,10 +994,27 @@ std::vector<std::array<cv::Vec3d, 3>> ComputeLocalSeamColorOffsets(
 
 }  // namespace
 
+MeshTextureView ReadMeshTextureView(const PatchMatchView& geometry,
+                                    const std::filesystem::path& image_path) {
+  if (geometry.camera.width == 0 || geometry.camera.height == 0 ||
+      geometry.camera.width > static_cast<unsigned>(std::numeric_limits<int>::max()) ||
+      geometry.camera.height > static_cast<unsigned>(std::numeric_limits<int>::max())) {
+    throw std::invalid_argument("Invalid texture camera dimensions");
+  }
+  cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_COLOR);
+  if (image.empty()) {
+    throw std::runtime_error("Failed to read texture image: " + image_path.string());
+  }
+  const cv::Size size(static_cast<int>(geometry.camera.width),
+                       static_cast<int>(geometry.camera.height));
+  if (image.size() != size) cv::resize(image, image, size, 0, 0, cv::INTER_AREA);
+  return {geometry, std::move(image)};
+}
+
 bool MeshTexturingOptions::Check() const {
   return atlas_size >= 16 && max_atlas_size >= atlas_size &&
          atlas_patch_padding >= 0 && inpaint_radius >= 0 &&
-         atlas_patch_padding * 2 + 1 < atlas_size &&
+         atlas_patch_padding <= (atlas_size - 2) / 2 &&
          std::isfinite(texture_scale) && texture_scale > 0.0 &&
          std::isfinite(min_cos_normal_angle) && min_cos_normal_angle >= -1.0 &&
          min_cos_normal_angle <= 1.0 &&
@@ -1017,6 +1035,14 @@ TexturedTriangleMesh TextureMesh(const DenseTriangleMesh& mesh,
   if (!options.Check()) {
     throw std::invalid_argument("Invalid mesh texturing options.");
   }
+  if (views.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::invalid_argument("Too many texture views");
+  }
+  struct ThreadBudget {
+    int previous = parallel::getNumThreads();
+    explicit ThreadBudget(int count) { parallel::setNumThreads(count); }
+    ~ThreadBudget() { parallel::setNumThreads(previous); }
+  } budget(options.num_threads);
   for (const Eigen::Vector3i& face : mesh.triangles) {
     if (face.minCoeff() < 0 ||
         face.maxCoeff() >= static_cast<int>(mesh.vertices.size()) ||
@@ -1188,17 +1214,12 @@ TexturedTriangleMesh TextureMesh(const DenseTriangleMesh& mesh,
   return result;
 }
 
-void WriteTexturedTriangleMesh(
+void WriteTexturedObj(
     const std::filesystem::path& output_directory,
     const TexturedTriangleMesh& textured_mesh) {
   if (textured_mesh.face_uvs.size() !=
       textured_mesh.mesh.triangles.size() * 3) {
     throw std::invalid_argument("Textured mesh has invalid UV coordinates.");
-  }
-  std::filesystem::create_directories(output_directory);
-  if (!cv::imwrite((output_directory / "texture.png").string(),
-                   textured_mesh.texture_atlas)) {
-    throw std::runtime_error("Failed to write texture atlas.");
   }
   std::ofstream material(output_directory / "mesh.mtl");
   std::ofstream object(output_directory / "mesh.obj");

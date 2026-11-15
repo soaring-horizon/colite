@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <cstdint>
 #include <set>
@@ -86,6 +87,48 @@ void TransformReconstruction(const SimilarityTransform3& transform,
       image.cam_from_world = transform.TransformPose(*image.cam_from_world);
     }
   }
+}
+
+SimilarityTransform3 NormalizeReconstruction(
+    Reconstruction* reconstruction, const bool fixed_scale,
+    const double extent, const double min_percentile,
+    const double max_percentile) {
+  if (reconstruction == nullptr || !std::isfinite(extent) || extent <= 0 ||
+      !std::isfinite(min_percentile) || !std::isfinite(max_percentile) ||
+      min_percentile < 0 || max_percentile > 1 || min_percentile > max_percentile)
+    throw std::invalid_argument("Invalid reconstruction normalization options");
+  SimilarityTransform3 transform;
+  transform.valid = true;
+  const auto& registered = reconstruction->RegisteredImageIds();
+  if (registered.size() < 2) return transform;
+  std::array<std::vector<double>, 3> coordinates;
+  for (const auto id : registered) {
+    const auto center = reconstruction->GetImage(id).cam_from_world->CameraCenter();
+    if (!center.allFinite()) throw std::invalid_argument("Non-finite camera center");
+    for (int axis = 0; axis < 3; ++axis) coordinates[axis].push_back(center[axis]);
+  }
+  const auto last = registered.size() - 1;
+  const auto begin = static_cast<std::size_t>(std::floor(min_percentile * last));
+  const auto end = static_cast<std::size_t>(std::ceil(max_percentile * last));
+  Eigen::Vector3d span, center;
+  for (int axis = 0; axis < 3; ++axis) {
+    auto& values = coordinates[axis];
+    std::sort(values.begin(), values.end());
+    span[axis] = values[end] - values[begin];
+    center[axis] = 0;
+    for (std::size_t idx = begin; idx <= end; ++idx)
+      center[axis] += values[idx] / static_cast<double>(end - begin + 1);
+  }
+  const double old_extent = span.norm();
+  if (!std::isfinite(old_extent))
+    throw std::invalid_argument("Non-finite camera extent");
+  if (!fixed_scale && old_extent >= std::numeric_limits<double>::epsilon())
+    transform.scale = extent / old_extent;
+  transform.translation = -transform.scale * center;
+  if (!(transform.scale > 0) || !std::isfinite(transform.scale) || !transform.translation.allFinite())
+    throw std::invalid_argument("Non-finite reconstruction normalization");
+  TransformReconstruction(transform, reconstruction);
+  return transform;
 }
 
 PositionPriorAlignmentSummary AlignReconstructionToPositionPriors(

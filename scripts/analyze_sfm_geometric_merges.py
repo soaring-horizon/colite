@@ -124,6 +124,8 @@ def main() -> None:
                 if not line.strip() or line.startswith("#"):
                     continue
                 fields = line.split()
+                if int(fields[11]) < 0 or int(fields[12]) < 0:
+                    continue
                 first = (int(fields[0]), int(fields[11]))
                 second = (int(fields[1]), int(fields[12]))
                 adjacency[first].append(second)

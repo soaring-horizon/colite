@@ -183,17 +183,20 @@ std::vector<SourceImageScore> SelectSourceImages(
   std::unordered_map<ImageId, SourceImageAccumulator> source_accumulators;
   for (const auto& [point3d_id, point3d] : reconstruction.Points3D()) {
     (void)point3d_id;
-    bool observes_target = false;
-    std::unordered_set<ImageId> source_images;
-    for (const TrackElement& element : point3d.track.elements) {
-      if (element.image_id == target_image_id) {
-        observes_target = true;
-      } else if (ImageUsableForMvs(reconstruction, element.image_id)) {
-        source_images.insert(element.image_id);
-      }
-    }
+    const bool observes_target = std::any_of(
+        point3d.track.elements.begin(), point3d.track.elements.end(),
+        [target_image_id](const TrackElement& element) {
+          return element.image_id == target_image_id;
+        });
     if (!observes_target) {
       continue;
+    }
+    std::unordered_set<ImageId> source_images;
+    for (const TrackElement& element : point3d.track.elements) {
+      if (element.image_id != target_image_id &&
+          ImageUsableForMvs(reconstruction, element.image_id)) {
+        source_images.insert(element.image_id);
+      }
     }
     for (const ImageId source_image_id : source_images) {
       SourceImageAccumulator& accumulator =
@@ -318,6 +321,49 @@ SparseDepthMap BuildSparseDepthMap(const Reconstruction& reconstruction,
   }
 
   return depth_map;
+}
+
+std::unordered_map<ImageId, std::vector<ImageId>> ComputeOverlappingImages(
+    const Reconstruction& reconstruction, std::size_t max_num_images,
+    std::size_t min_num_shared_points) {
+  std::unordered_map<ImageId, std::unordered_map<ImageId, std::size_t>> counts;
+  std::vector<ImageId> track_images;
+  for (const auto& [point_id, point] : reconstruction.Points3D()) {
+    (void)point_id;
+    track_images.clear();
+    for (const TrackElement& element : point.track.elements) {
+      if (ImageUsableForMvs(reconstruction, element.image_id)) {
+        track_images.push_back(element.image_id);
+      }
+    }
+    std::sort(track_images.begin(), track_images.end());
+    track_images.erase(std::unique(track_images.begin(), track_images.end()),
+                        track_images.end());
+    for (std::size_t i = 0; i < track_images.size(); ++i) {
+      for (std::size_t j = i + 1; j < track_images.size(); ++j) {
+        ++counts[track_images[i]][track_images[j]];
+        ++counts[track_images[j]][track_images[i]];
+      }
+    }
+  }
+  std::unordered_map<ImageId, std::vector<ImageId>> output;
+  for (const ImageId id : reconstruction.RegisteredImageIds()) {
+    std::vector<std::pair<ImageId, std::size_t>> ranked;
+    const auto found = counts.find(id);
+    if (found != counts.end()) {
+      for (const auto& pair : found->second) {
+        if (pair.second >= min_num_shared_points) ranked.push_back(pair);
+      }
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+      return a.second != b.second ? a.second > b.second : a.first < b.first;
+    });
+    if (max_num_images > 0 && ranked.size() > max_num_images) ranked.resize(max_num_images);
+    auto& images = output[id];
+    images.reserve(ranked.size());
+    for (const auto& pair : ranked) images.push_back(pair.first);
+  }
+  return output;
 }
 
 MvsPipelineSummary RunMvsPipeline(const Reconstruction& reconstruction,

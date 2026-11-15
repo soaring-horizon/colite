@@ -12,13 +12,14 @@
 
 namespace colite {
 
-// 局部 BA 选项。第一版只优化相机外参和 3D 点，内参固定；
-// 后续再按相机模型参数组接入可选内参优化。
+// 局部 BA 选项。共享内参仅在局部目标覆盖该相机全部已注册图像时开放。
 struct LocalBundleAdjustmentOptions {
   int max_num_iterations = 25;
-  double loss_scale = 4.0;
-  std::size_t max_num_images = 8;
-  // 不参与位姿优化、但对局部 3D 点提供约束的 fixed images 数量上限。
+  BundleAdjustmentSolverOptions solver;
+  double loss_scale = 1.0;
+  std::size_t max_num_images = 6;
+  // 未提供显式修改点 scope 时，自动收集外部固定图像的数量上限。
+  // Mapper 的 scoped BA 会纳入所选可变点的完整外部观测，不受此上限截断。
   std::size_t max_num_fixed_images = 8;
   bool refine_poses = true;
   bool refine_points = true;
@@ -33,6 +34,9 @@ struct LocalBundleAdjustmentOptions {
 
 struct LocalBundleAdjustmentSummary {
   bool success = false;
+  std::string linear_solver_type;
+  std::string requested_linear_solver_type;
+  int solver_num_threads = 0;
   ImageId root_image_id = kInvalidImageId;
   std::set<ImageId> local_image_ids;
   std::set<ImageId> fixed_image_ids;
@@ -40,22 +44,44 @@ struct LocalBundleAdjustmentSummary {
   std::size_t num_constant_images = 0;
   std::size_t num_variable_images = 0;
   std::size_t num_variable_points = 0;
+  std::size_t num_constant_points = 0;
   std::size_t num_constant_cameras = 0;
   std::size_t num_variable_cameras = 0;
   std::size_t num_gauge_constant_translation_images = 0;
   std::size_t num_residuals = 0;
+  std::size_t num_scalar_residuals = 0;
   double initial_mean_reprojection_error = -1.0;
   double final_mean_reprojection_error = -1.0;
+  double initial_cost = -1.0;
+  double final_cost = -1.0;
+  int num_unsuccessful_steps = 0;
+  int num_invalid_steps = 0;
   std::set<ImageId> gauge_constant_pose_image_ids;
   std::map<ImageId, std::vector<int>> gauge_constant_translation_idxs;
   std::string message;
 };
 
+// Explicit mapper scope: newly allocated points and modified short tracks
+// may be optimized with their complete external observations. Other points
+// remain variable only when fully contained in the local image window.
+struct LocalBundleAdjustmentScope {
+  std::set<Point3DId> modified_point_ids;
+  Point3DId first_new_point_id = kInvalidPoint3DId;
+};
+
+// Select the covisibility window shared by local triangulation and BA.
+std::set<ImageId> FindLocalBundleImages(
+    const Reconstruction& reconstruction,
+    ImageId root_image_id,
+    std::size_t max_num_images);
+
 // 围绕 root_image_id 构建一个小的局部 BA 窗口并优化。
-// 局部窗口包含 root 图像、与其共视点相连的已注册图像，以及这些图像观测到的 3D 点。
+// 稳定点约束局部位姿；提供 scope 时，仅对完整局部点及修改的新点 / 短轨迹
+// 开放点坐标优化，并纳入这些点的全部必要外部固定观测。
 LocalBundleAdjustmentSummary AdjustLocalBundle(
     ImageId root_image_id,
     const LocalBundleAdjustmentOptions& options,
-    Reconstruction* reconstruction);
+    Reconstruction* reconstruction,
+    const LocalBundleAdjustmentScope* scope = nullptr);
 
 }  // namespace colite

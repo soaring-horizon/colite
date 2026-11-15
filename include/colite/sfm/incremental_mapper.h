@@ -14,6 +14,7 @@
 #include "colite/sfm/incremental_triangulator.h"
 #include "colite/sfm/local_bundle_adjuster.h"
 #include "colite/sfm/observation_filter.h"
+#include "colite/sfm/structureless_registrar.h"
 
 namespace colite {
 
@@ -25,7 +26,12 @@ struct IncrementalMapperOptions {
   LocalBundleAdjustmentOptions local_bundle_adjustment;
   ObservationFilterOptions local_retriangulation_filter;
   ObservationFilterOptions observation_filter;
+  StructurelessRegistrationOptions structureless_registration;
+  bool use_structureless_registration = false;
   bool run_local_bundle_adjustment = true;
+  // COLMAP iterative local BA: robust first pass, quadratic later passes.
+  std::size_t ba_local_max_refinements = 2;
+  double ba_local_max_refinement_change = 0.001;
   bool run_local_retriangulation_filter = true;
   bool run_observation_filter = true;
 };
@@ -48,10 +54,14 @@ struct IncrementalMapperSummary {
   // 本次 PnP 注册实际使用的重投影误差阈值。失败重试时该值可能被动态放宽。
   double registration_max_reprojection_error_px = 0.0;
   ImageRegistrationSummary registration;
+  StructurelessRegistrationSummary structureless_registration;
+  bool used_structureless_registration = false;
   IncrementalTriangulatorSummary track_completion;
   IncrementalTriangulatorSummary triangulation;
   IncrementalTriangulatorSummary local_retriangulation;
   LocalBundleAdjustmentSummary local_bundle_adjustment;
+  std::size_t num_local_refinements = 0;
+  double last_local_refinement_change = 0.0;
   ObservationFilterSummary observation_filter;
   double registration_seconds = 0.0;
   double track_completion_seconds = 0.0;
@@ -64,6 +74,12 @@ struct IncrementalMapperSummary {
 
 // 完整增量建图参数。initialization 负责初始图像对，mapper 负责后续每张图像。
 struct IncrementalMappingOptions {
+  // Standard pipeline CPU budget; controllers scope core/Ceres parallelism.
+  // -1 and 0 select available hardware, as in COLMAP.
+  int num_threads = -1;
+  bool relax_initialization_constraints = false;
+  // Budget for geometrically accepted initial reconstructions, not pair checks.
+  std::size_t max_num_initialization_trials = 200;
   IncrementalInitializerOptions initialization;
   IncrementalMapperOptions mapper;
   GlobalBundleAdjustmentOptions global_bundle_adjustment;
@@ -80,6 +96,16 @@ struct IncrementalMappingOptions {
   bool run_global_bundle_adjustment = true;
   bool run_global_observation_filter = true;
   bool run_final_global_bundle_adjustment = true;
+  // COLMAP's ba_global_max_refinements / ba_global_max_refinement_change.
+  std::size_t max_num_global_refinements = 5;
+  double global_refinement_change = 0.0005;
+  // Single-camera images are trivial one-image frames. Follow COLMAP 4's
+  // growth-triggered global refinement after successful registration.
+  double ba_global_frames_ratio = 1.1;
+  double ba_global_points_ratio = 1.1;
+  std::size_t ba_global_frames_freq = 500;
+  std::size_t ba_global_points_freq = 250000;
+  bool collect_refinement_diagnostics = false;
   // Empty means all images. Registration and initialization are restricted to
   // this set when running one component of a multi-model reconstruction.
   std::set<ImageId> allowed_image_ids;
@@ -101,9 +127,69 @@ struct ImageRegistrationFailureSummary {
   std::string message;
 };
 
+struct GlobalRefinementObservationChange {
+  std::size_t iteration = 0;
+  std::string stage;
+  ImageId image_id = kInvalidImageId;
+  Point2DIdx point2d_idx = kInvalidPoint2DIdx;
+  Point3DId before_point = kInvalidPoint3DId;
+  Point3DId after_point = kInvalidPoint3DId;
+  double before_error = -1.0;
+  double after_error = -1.0;
+  bool previously_removed = false;
+  std::string reason;
+};
+
+struct GlobalRefinementDiagnostics {
+  std::size_t iteration = 0;
+  bool traced = false;
+  std::size_t observations_before = 0;
+  std::size_t observations_after_completion = 0;
+  std::size_t observations_after_filter = 0;
+  std::size_t completed_events = 0;
+  std::size_t merged_observation_events = 0;
+  std::size_t filtered_observations = 0;
+  std::size_t removed_reprojection_observations = 0;
+  std::size_t removed_invalid_observations = 0;
+  std::size_t removed_short_track_points = 0;
+  std::size_t removed_low_angle_points = 0;
+  std::size_t unique_added = 0;
+  std::size_t unique_removed = 0;
+  std::size_t completion_removed = 0;
+  std::size_t reassigned = 0;
+  std::size_t readded_previous = 0;
+  std::size_t added_then_removed = 0;
+  std::size_t net_membership_changes = 0;
+  double event_change_ratio = 0.0;
+  double initial_cost = -1.0;
+  double final_cost = -1.0;
+  double p95_before_ba = -1.0;
+  double p95_after_ba = -1.0;
+  double p95_after_completion = -1.0;
+  double p95_after_filter = -1.0;
+  double common_p95_before = -1.0;
+  double common_p95_after = -1.0;
+};
+
+struct InitialPairRefinementSummary {
+  ImagePair pair;
+  bool success = false;
+  bool bundle_adjustment_attempted = false;
+  bool normalized = false;
+  double normalization_scale = 1.0;
+  std::size_t num_points_before = 0;
+  std::size_t num_points_after = 0;
+  NegativeDepthFilterSummary negative_depth_filter;
+  GlobalBundleAdjustmentSummary bundle_adjustment;
+  ObservationFilterSummary observation_filter;
+  std::string message;
+};
+
 struct IncrementalMappingSummary {
   bool success = false;
   IncrementalInitializerSummary initialization;
+  std::vector<InitialPairRefinementSummary> initialization_refinements;
+  double initial_bundle_adjustment_seconds = 0.0;
   std::vector<IncrementalMapperSummary> registrations;
   std::vector<ImageRegistrationFailureSummary> failed_registrations;
   IncrementalTriangulatorSummary global_track_completion;
@@ -112,6 +198,14 @@ struct IncrementalMappingSummary {
   GlobalBundleAdjustmentSummary global_bundle_adjustment;
   ObservationFilterSummary global_observation_filter;
   GlobalBundleAdjustmentSummary final_global_bundle_adjustment;
+  std::size_t num_global_refinements = 0;
+  std::size_t num_growth_global_refinements = 0;
+  std::size_t num_registration_recovery_attempts = 0;
+  std::size_t num_registration_recovery_successes = 0;
+  int num_global_ba_invalid_steps = 0;
+  double last_global_refinement_change = 0.0;
+  std::vector<GlobalRefinementDiagnostics> global_refinement_diagnostics;
+  std::vector<GlobalRefinementObservationChange> global_observation_changes;
   std::size_t num_registered_images = 0;
   std::size_t num_points3d = 0;
   double initialization_seconds = 0.0;
@@ -141,7 +235,8 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
     const IncrementalTriangulatorOptions& options,
     const ObservationFilterOptions* local_filter_options,
     Reconstruction* reconstruction,
-    const IncrementalTriangulatorCache* triangulator_cache = nullptr);
+    const IncrementalTriangulatorCache* triangulator_cache = nullptr,
+    const std::set<ImageId>* local_window = nullptr);
 
 // 所有图像完成注册后重新遍历一次已注册图像，在完整位姿图上创建增量阶段
 // 遗漏的点。该阶段对应 COLMAP 全局优化前的 Retriangulate。
@@ -162,6 +257,7 @@ std::optional<ImageId> SelectNextImage(
 IncrementalMappingSummary RunIncrementalMapping(
     const MatchGraph& graph,
     const IncrementalMappingOptions& options,
-    Reconstruction* reconstruction);
+    Reconstruction* reconstruction,
+    InitialPairTrialState* initial_trial_state = nullptr);
 
 }  // namespace colite

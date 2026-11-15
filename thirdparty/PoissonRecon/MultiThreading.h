@@ -59,6 +59,8 @@ namespace PoissonRecon
 		static const std::vector< std::string > ScheduleNames;
 
 		static unsigned int NumThreads( void ){ return _NumThreads; }
+		// Colite integration: honor the caller's per-invocation thread budget.
+		static void SetNumThreads( unsigned int count ){ _NumThreads = count ? count : 1; }
 		static ParallelType ParallelizationType;
 		static size_t ChunkSize;
 		static ScheduleType Schedule;

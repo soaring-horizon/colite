@@ -6,6 +6,8 @@ namespace colite::cuda_matcher {
 
 bool IsAvailable() { return false; }
 
+void ReleaseWorkspace() {}
+
 std::unique_ptr<DescriptorBuffer> CreateBuffer(const std::uint8_t*,
                                                int,
                                                int,

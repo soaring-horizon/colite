@@ -277,6 +277,26 @@ TEST(CameraTest, ProjectionRejectsNonPositiveDepth) {
   const Camera camera = PinholeCamera();
   EXPECT_THROW(ProjectPoint(camera, Eigen::Vector3d(0.0, 0.0, 0.0)),
                std::invalid_argument);
+  Eigen::Vector2d projected;
+  const double epsilon = std::numeric_limits<double>::epsilon();
+  EXPECT_FALSE(ProjectPointWithCameraParams(camera.model_id, camera.params.data(),
+      Eigen::Vector3d(0, 0, epsilon / 2), &projected));
+  ASSERT_TRUE(ProjectPointWithCameraParams(camera.model_id, camera.params.data(),
+      Eigen::Vector3d(0, 0, epsilon), &projected));
+  EXPECT_EQ(projected, Eigen::Vector2d(camera.params[2], camera.params[3]));
+}
+
+TEST(CameraTest, OptionalUnprojectionSeparatesPixelDomainFromInvalidCamera) {
+  auto camera = SimpleRadialCamera();
+  camera.params[3] = -1;
+  const Eigen::Vector2d center(camera.params[1], camera.params[2]);
+  ASSERT_TRUE(TryUnprojectPixel(camera, center, 1));
+  EXPECT_EQ(*TryUnprojectPixel(camera, center, 1), Eigen::Vector3d(0, 0, 1));
+  EXPECT_FALSE(TryUnprojectPixel(camera, {0, 0}, 1));
+  EXPECT_THROW(UnprojectPixel(camera, {0, 0}, 1), std::domain_error);
+  EXPECT_THROW(TryUnprojectPixel(camera, center, 0), std::invalid_argument);
+  camera.params.pop_back();
+  EXPECT_THROW(TryUnprojectPixel(camera, center, 1), std::invalid_argument);
 }
 
 TEST(CameraTest, InvalidModelProjectionThrows) {

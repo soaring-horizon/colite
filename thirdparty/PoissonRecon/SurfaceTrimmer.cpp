@@ -569,6 +569,8 @@ int Execute( AuxDataFactories ... auxDataFactories )
 
 int RunSurfaceTrimmer( int argc , char* argv[] )
 {
+	// Clear flags left by a previous embedded invocation.
+	for( int i=0 ; params[i] ; ++i ) params[i]->set = false;
 	CmdLineParse( argc-1 , &argv[1] , params );
 
 	if( !In.set || !Trim.set )

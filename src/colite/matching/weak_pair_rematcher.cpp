@@ -22,9 +22,7 @@ bool IsNearbyPair(const ImagePair& pair, std::size_t nearby_image_window) {
 }
 
 bool IsUsableGeometry(const TwoViewGeometry& geometry) {
-  return geometry.type != TwoViewGeometry::Type::kUndefined &&
-         geometry.type != TwoViewGeometry::Type::kDegenerate &&
-         !geometry.inlier_matches.empty();
+  return geometry.HasUsableCorrespondences();
 }
 
 struct RematchCandidate {
@@ -48,7 +46,8 @@ const Camera* FindCamera(const std::map<ImageId, Camera>& cameras_by_image,
 WeakPairRematchingSummary RematchWeakImagePairs(
     const std::map<ImageId, Camera>& cameras_by_image,
     const WeakPairRematchingOptions& options,
-    MatchGraph* graph) {
+    MatchGraph* graph,
+    const PreparedFeatureMatcherCache* prepared_cache) {
   WeakPairRematchingSummary summary;
   if (graph == nullptr) {
     return summary;
@@ -65,13 +64,16 @@ WeakPairRematchingSummary RematchWeakImagePairs(
   }();
 
   std::vector<RematchCandidate> candidates(pairs.size());
-  std::map<ImageId, std::unique_ptr<PreparedFeatureMatcher>>
-      prepared_features;
-  for (const auto& [image_id, features] : graph->features) {
-    prepared_features.emplace(
-        image_id, std::make_unique<PreparedFeatureMatcher>(
-                      features, options.relaxed_matching.backend));
+  PreparedFeatureMatcherCache owned_prepared;
+  if (prepared_cache == nullptr) {
+    for (const auto& [image_id, features] : graph->features) {
+      owned_prepared.emplace(
+          image_id, std::make_unique<PreparedFeatureMatcher>(
+                        features, options.relaxed_matching.backend));
+    }
   }
+  const auto& prepared_features = prepared_cache == nullptr
+      ? owned_prepared : *prepared_cache;
   parallel::parallel_for_(
       parallel::Range(0, static_cast<int>(pairs.size())),
       [&](const parallel::Range& range) {
@@ -98,7 +100,7 @@ WeakPairRematchingSummary RematchWeakImagePairs(
               prepared2_it == prepared_features.end() ||
               camera1 == nullptr || camera2 == nullptr ||
               old_geometry == nullptr || !IsUsableGeometry(*old_geometry) ||
-              old_geometry->F.norm() <= 0.0) {
+              !HasGuidedMatchingModel(*old_geometry)) {
             continue;
           }
           const std::size_t old_num_inliers =
@@ -108,9 +110,9 @@ WeakPairRematchingSummary RematchWeakImagePairs(
           const std::size_t old_num_matches =
               old_matches == nullptr ? 0 : old_matches->size();
           const std::vector<FeatureMatch> guided_matches =
-              MatchPreparedFeatureSetsGuidedFundamental(
-                  *prepared1_it->second, *prepared2_it->second,
-                  old_geometry->F,
+              MatchPreparedFeaturePairGuided(
+                  *camera1, *features1, *prepared1_it->second,
+                  *camera2, *features2, *prepared2_it->second, *old_geometry,
                   options.guided_matching.max_sampson_error_px,
                   options.relaxed_matching, &candidate.guided_stats);
           candidate.rematched = true;

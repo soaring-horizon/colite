@@ -20,7 +20,9 @@
 
 #include "colite/controllers/recon_sfm_controller.h"
 #include "colite/core/camera.h"
+#include "colite/core/memory.h"
 #include "colite/core/parallel.h"
+#include "colite/core/progress.h"
 #include "colite/io/camera_prior.h"
 #include "colite/io/sfm_workspace.h"
 
@@ -42,6 +44,9 @@ std::vector<std::pair<std::string, std::string>> FeatureCacheEntries(
     const std::vector<std::filesystem::path>& image_paths) {
   std::vector<std::pair<std::string, std::string>> entries;
   entries.emplace_back("stage", "features");
+  entries.emplace_back("execution", SfmFeatureExecutionKey(options.execution));
+  entries.emplace_back("algorithm_version", "colmap_sift_oriented_levels_v7_shared_controls");
+  entries.emplace_back("image_masks", FeatureMasks(options.image_path, image_paths, options.execution.masks).Fingerprint());
   entries.emplace_back("camera_prior_version", "camera_models_auto_exif_v4");
   entries.emplace_back("image_path", options.image_path.lexically_normal().string());
   entries.emplace_back("focal_length", ToConfigValue(options.focal_length));
@@ -58,9 +63,23 @@ std::vector<std::pair<std::string, std::string>> FeatureCacheEntries(
   entries.emplace_back("default_focal_length_factor",
                        ToConfigValue(options.default_focal_length_factor));
   entries.emplace_back("max_num_features", std::to_string(options.max_num_features));
+  entries.emplace_back("extractor_type",
+                       std::string(FeatureExtractorTypeName(options.extractor_type)));
   entries.emplace_back("backend", SiftBackendName(options.backend));
   entries.emplace_back("resolved_backend",
                        SiftBackendName(ResolveSiftBackend(options.backend)));
+  entries.emplace_back("aliked_min_score", ToConfigValue(options.aliked_min_score));
+  entries.emplace_back("aliked_model_path",
+                       options.aliked_model_path.lexically_normal().string());
+  if (!options.aliked_model_path.empty() &&
+      std::filesystem::exists(options.aliked_model_path)) {
+    entries.emplace_back("aliked_model_size",
+                         std::to_string(std::filesystem::file_size(
+                             options.aliked_model_path)));
+    entries.emplace_back("aliked_model_mtime",
+                         ToConfigValue(std::filesystem::last_write_time(
+                             options.aliked_model_path)));
+  }
   entries.emplace_back("num_images", std::to_string(image_paths.size()));
   for (std::size_t i = 0; i < image_paths.size(); ++i) {
     const std::filesystem::path& image_path = image_paths[i];
@@ -138,7 +157,11 @@ class ImageJobQueue {
 
 FeatureExtractorController::FeatureExtractorController(
     FeatureExtractorControllerOptions options)
-    : options_(std::move(options)) {}
+    : options_(std::move(options)) {
+  if (options_.extractor_type == FeatureExtractorType::kSift)
+    options_.backend = ResolveSfmSiftOptions(options_.execution, options_.backend, options_.max_num_features).backend;
+  options_.aliked_max_image_size = EffectiveSfmImageSize(options_.execution, options_.extractor_type);
+}
 
 FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
   FeatureExtractorControllerSummary summary;
@@ -148,8 +171,11 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
     throw std::runtime_error("No input images found");
   }
   LOG(INFO) << "Feature extraction: images=" << image_paths.size()
+            << " type=" << FeatureExtractorTypeName(options_.extractor_type)
             << " backend="
-            << SiftBackendName(ResolveSiftBackend(options_.backend))
+            << (options_.extractor_type == FeatureExtractorType::kSift
+                    ? SiftBackendName(ResolveSiftBackend(options_.backend))
+                    : "onnx")
             << " max_features=" << options_.max_num_features
             << " requested_threads=" << options_.num_threads
             << " workspace=" << options_.workspace_path.string();
@@ -173,25 +199,39 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
       options_.default_focal_length_factor;
   const SfmCameraSetup camera_setup =
       BuildSfmCameraSetup(image_paths, camera_options);
+  const FeatureMasks masks(options_.image_path, image_paths, options_.execution.masks);
 
   WriteWorkspaceCameras(options_.workspace_path, camera_setup.cameras);
   WriteWorkspaceImages(options_.workspace_path, camera_setup.images);
 
-  SiftExtractionOptions sift_options;
-  sift_options.backend = options_.backend;
-  sift_options.max_num_features = options_.max_num_features;
+  SiftExtractionOptions sift_options = options_.extractor_type == FeatureExtractorType::kSift
+      ? ResolveSfmSiftOptions(options_.execution, options_.backend, options_.max_num_features)
+      : SiftExtractionOptions{};
 
   int num_threads = EffectiveFeatureExtractionThreads(options_.num_threads);
   const SiftBackend resolved_backend = ResolveSiftBackend(sift_options.backend);
+  AlikedExtractionOptions aliked_options;
+  aliked_options.extractor_type = options_.extractor_type;
+  aliked_options.model_path = options_.aliked_model_path;
+  aliked_options.max_num_features = options_.max_num_features;
+  aliked_options.min_score = options_.aliked_min_score;
+  aliked_options.num_threads = num_threads;
+  aliked_options.max_image_size = options_.aliked_max_image_size;
+  aliked_options.cuda_memory_limit_mb = options_.learned_cuda_memory_limit_mb;
+  if (options_.execution.use_gpu.has_value()) aliked_options.execution_provider =
+      *options_.execution.use_gpu ? OnnxExecutionProvider::kCuda : OnnxExecutionProvider::kCpu;
+  aliked_options.gpu_index = std::max(0, options_.execution.gpu_index);
 #if defined(COLITE_ENABLE_SIFT_PARALLEL)
   // SIFT 内部固定线程池按连续图像区域切分；外层保持单图，避免两层并行争抢核心。
-  parallel::setNumThreads(resolved_backend == SiftBackend::kCudaSift ||
+  parallel::setNumThreads(options_.extractor_type != FeatureExtractorType::kSift ||
+                                  resolved_backend == SiftBackend::kCudaSift ||
                                   resolved_backend == SiftBackend::kCudaVlSift
                               ? 1
                               : num_threads);
   num_threads = 1;
 #else
-  if (resolved_backend == SiftBackend::kCudaSift ||
+  if (options_.extractor_type != FeatureExtractorType::kSift ||
+      resolved_backend == SiftBackend::kCudaSift ||
       resolved_backend == SiftBackend::kCudaVlSift) {
     num_threads = 1;
   }
@@ -205,16 +245,23 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
   std::exception_ptr first_exception;
   std::mutex exception_mutex;
   std::atomic<std::size_t> num_features{0};
+  std::atomic<std::size_t> completed_images{0};
+  ReportProgress("feature_extraction", 0, image_paths.size());
 
   const auto worker = [&]() {
+    const ScopedAlikedThreadCache inference_cache_scope;
     while (true) {
       const std::optional<std::size_t> job_idx = jobs.Pop();
       if (!job_idx.has_value()) {
         return;
       }
       try {
-        const FeatureSet features =
-            ExtractSiftFeaturesFromFile(image_paths[*job_idx], sift_options);
+        FeatureSet features =
+            options_.extractor_type == FeatureExtractorType::kSift
+                ? ExtractSiftFeaturesFromFile(image_paths[*job_idx], sift_options)
+                : ExtractAlikedFeaturesFromFile(image_paths[*job_idx],
+                                                aliked_options);
+        masks.Apply(image_paths[*job_idx], &features);
         num_features.fetch_add(features.keypoints.size(),
                                std::memory_order_relaxed);
         VLOG(1) << "Extracted image " << (*job_idx + 1) << "/"
@@ -224,6 +271,8 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
         WriteWorkspaceFeatureSet(options_.workspace_path,
                                  static_cast<ImageId>(*job_idx + 1),
                                  features);
+        ReportProgress("feature_extraction", completed_images.fetch_add(1) + 1,
+                       image_paths.size(), image_paths[*job_idx].filename().u8string());
       } catch (...) {
         std::lock_guard<std::mutex> lock(exception_mutex);
         if (first_exception == nullptr) {
@@ -245,6 +294,7 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
   if (first_exception != nullptr) {
     std::rethrow_exception(first_exception);
   }
+  ReleaseUnusedMemory();
 
   const auto end = std::chrono::steady_clock::now();
   summary.success = true;
@@ -263,6 +313,8 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
                << "features " << summary.num_features << "\n"
                << "feature_extraction_seconds " << summary.elapsed_seconds
                << "\n";
+  summary_file.close();
+  if (!summary_file) throw std::runtime_error("Failed to write feature summary");
   WriteWorkspaceCacheMetadata(
       options_.workspace_path, "features", config_hash,
       {{"images", std::to_string(summary.num_images)},

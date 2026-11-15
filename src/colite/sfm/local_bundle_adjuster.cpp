@@ -9,10 +9,12 @@
 
 #include <Eigen/Geometry>
 #include <ceres/ceres.h>
+#include <glog/logging.h>
 
 #include "colite/core/geometry.h"
 #include "colite/core/parallel.h"
 #include "ceres_manifold_compat.h"
+#include "bundle_adjustment_utils.h"
 
 namespace colite {
 namespace {
@@ -339,22 +341,9 @@ std::map<ImageId, std::vector<int>> BuildGaugeTranslationConstraints(
     const std::set<ImageId>& constant_pose_image_ids,
     const std::map<ImageId, std::vector<int>>& explicit_constraints,
     std::set<ImageId>* gauge_constant_pose_image_ids) {
-  std::map<ImageId, std::vector<int>> constraints = explicit_constraints;
-  if (gauge_constant_pose_image_ids == nullptr ||
-      gauge_fixing == BundleGaugeFixing::kNone || pose_blocks.empty() ||
-      !constant_pose_image_ids.empty()) {
-    return constraints;
-  }
-
-  auto it = pose_blocks.begin();
-  gauge_constant_pose_image_ids->insert(it->first);
-  if (gauge_fixing == BundleGaugeFixing::kFirstTwoImages) {
-    ++it;
-    if (it != pose_blocks.end()) {
-      constraints.emplace(it->first, std::vector<int>{0});
-    }
-  }
-  return constraints;
+  return bundle_internal::GaugeTranslationConstraints(
+      gauge_fixing, pose_blocks, constant_pose_image_ids, explicit_constraints,
+      gauge_constant_pose_image_ids);
 }
 
 std::vector<std::pair<ImageId, std::size_t>> SortImageScores(
@@ -432,6 +421,7 @@ std::set<ImageId> CollectFixedImages(
     const std::set<Point3DId>& point_ids,
     const LocalBundleAdjustmentOptions& options) {
   std::set<ImageId> fixed_image_ids;
+  if (options.max_num_fixed_images == 0) return fixed_image_ids;
   std::map<ImageId, std::size_t> fixed_image_scores;
   for (const Point3DId point3d_id : point_ids) {
     const Point3D& point3d = reconstruction.GetPoint3D(point3d_id);
@@ -486,12 +476,17 @@ bool ContainsAllRegisteredImagesForCamera(
 std::vector<Observation> CollectObservations(
     const Reconstruction& reconstruction,
     const std::set<ImageId>& image_ids,
-    const std::set<Point3DId>& point_ids) {
+    const std::set<Point3DId>& point_ids,
+    const std::set<ImageId>& local_image_ids,
+    const std::set<Point3DId>* scoped_variable_point_ids) {
   std::vector<Observation> observations;
   for (const Point3DId point3d_id : point_ids) {
     const Point3D& point3d = reconstruction.GetPoint3D(point3d_id);
+    const auto& observing_images = scoped_variable_point_ids != nullptr &&
+        scoped_variable_point_ids->count(point3d_id) == 0 ? local_image_ids
+                                                        : image_ids;
     for (const TrackElement& element : point3d.track.elements) {
-      if (image_ids.find(element.image_id) == image_ids.end()) {
+      if (observing_images.count(element.image_id) == 0) {
         continue;
       }
       const Image& image = reconstruction.GetImage(element.image_id);
@@ -559,12 +554,25 @@ void WritePointBlock(const PointBlock& block, Point3D* point3d) {
 
 }  // namespace
 
+std::set<ImageId> FindLocalBundleImages(
+    const Reconstruction& reconstruction,
+    ImageId root_image_id,
+    std::size_t max_num_images) {
+  return CollectLocalImagesBySharedPoints(reconstruction, root_image_id,
+                                         max_num_images);
+}
+
 LocalBundleAdjustmentSummary AdjustLocalBundle(
     ImageId root_image_id,
     const LocalBundleAdjustmentOptions& options,
-    Reconstruction* reconstruction) {
+    Reconstruction* reconstruction,
+    const LocalBundleAdjustmentScope* scope) {
   LocalBundleAdjustmentSummary summary;
   summary.root_image_id = root_image_id;
+  if (const auto error = options.solver.ValidationError(options.max_num_iterations); !error.empty()) {
+    summary.message = error + "; reconstruction unchanged";
+    return summary;
+  }
 
   if (reconstruction == nullptr ||
       !reconstruction->IsImageRegistered(root_image_id)) {
@@ -572,16 +580,53 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
     return summary;
   }
 
-  const std::set<ImageId> local_image_ids = CollectLocalImagesBySharedPoints(
+  const std::set<ImageId> local_image_ids = FindLocalBundleImages(
       *reconstruction, root_image_id, options.max_num_images);
-  const std::set<Point3DId> point_ids =
+  std::set<Point3DId> point_ids =
       CollectLocalPoints(*reconstruction, local_image_ids);
-  const std::set<ImageId> fixed_image_ids =
-      CollectFixedImages(*reconstruction, local_image_ids, point_ids, options);
+  std::set<Point3DId> scoped_variable_point_ids;
+  std::set<ImageId> fixed_image_ids;
+  if (scope == nullptr) {
+    fixed_image_ids = CollectFixedImages(*reconstruction, local_image_ids,
+                                        point_ids, options);
+  } else {
+    // As in COLMAP's local BA, points fully observed in the local images can
+    // vary; explicitly changed new/short tracks also bring all outside views.
+    for (const Point3DId point_id : point_ids) {
+      const auto& track = reconstruction->GetPoint3D(point_id).track;
+      if (std::all_of(track.elements.begin(), track.elements.end(),
+                      [&](const TrackElement& element) {
+                        return local_image_ids.count(element.image_id) != 0;
+                      })) {
+        scoped_variable_point_ids.insert(point_id);
+      }
+    }
+    constexpr std::size_t kMaxShortTrackLength = 15;
+    for (const Point3DId point_id : scope->modified_point_ids) {
+      // A disconnected point-only component cannot anchor the local poses.
+      // Leave changed points outside this window to the global refinement.
+      if (point_ids.count(point_id) == 0) continue;
+      const auto& point = reconstruction->GetPoint3D(point_id);
+      if (point_id >= scope->first_new_point_id ||
+          point.track.Length() <= kMaxShortTrackLength) {
+        scoped_variable_point_ids.insert(point_id);
+      }
+    }
+    for (const Point3DId point_id : scoped_variable_point_ids) {
+      for (const auto& element : reconstruction->GetPoint3D(point_id).track.elements) {
+        if (local_image_ids.count(element.image_id) == 0 &&
+            reconstruction->IsImageRegistered(element.image_id) &&
+            reconstruction->GetImage(element.image_id).HasPose()) {
+          fixed_image_ids.insert(element.image_id);
+        }
+      }
+    }
+  }
   const std::set<ImageId> image_ids =
       UnionImageIds(local_image_ids, fixed_image_ids);
-  const std::vector<Observation> observations =
-      CollectObservations(*reconstruction, image_ids, point_ids);
+  const std::vector<Observation> observations = CollectObservations(
+      *reconstruction, image_ids, point_ids, local_image_ids,
+      scope == nullptr ? nullptr : &scoped_variable_point_ids);
   summary.local_image_ids = local_image_ids;
   summary.fixed_image_ids = fixed_image_ids;
   summary.num_local_images = local_image_ids.size();
@@ -657,10 +702,21 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
     }
   }
 
+  std::map<Point3DId, std::size_t> point_observation_counts;
+  for (const auto& observation : observations) {
+    ++point_observation_counts[observation.point3d_id];
+  }
   for (auto& [point3d_id, block] : point_blocks) {
     problem.AddParameterBlock(block.xyz, 3);
-    if (!options.refine_points) {
+    // Moving an incompletely observed point can corrupt observations outside
+    // this local objective, and a single observation cannot constrain depth.
+    const auto count = point_observation_counts[point3d_id];
+    if (!options.refine_points ||
+        (scope != nullptr && scoped_variable_point_ids.count(point3d_id) == 0) ||
+        count < 2 ||
+        count < reconstruction->GetPoint3D(point3d_id).track.Length()) {
       problem.SetParameterBlockConstant(block.xyz);
+      ++summary.num_constant_points;
     } else {
       (void)point3d_id;
       ++summary.num_variable_points;
@@ -692,7 +748,7 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
     // camera are represented in the local bundle; global BA will still refine
     // the camera from the complete reconstruction.
     const bool bundle_covers_camera = ContainsAllRegisteredImagesForCamera(
-        *reconstruction, camera_id, image_ids);
+        *reconstruction, camera_id, scope == nullptr ? image_ids : local_image_ids);
     if (constant_indices.size() == params.size() || !bundle_covers_camera) {
       problem.SetParameterBlockConstant(params.data());
       ++summary.num_constant_cameras;
@@ -706,12 +762,13 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
     }
   }
 
+  // Ceres owns each distinct loss pointer once, even when residuals share it.
+  ceres::LossFunction* loss_function =
+      options.loss_scale > 0.0 ? new ceres::SoftLOneLoss(options.loss_scale)
+                               : nullptr;
   for (const Observation& observation : observations) {
     const Image& image = reconstruction->GetImage(observation.image_id);
     const Camera& camera = reconstruction->GetCamera(image.camera_id);
-    ceres::LossFunction* loss_function =
-        options.loss_scale > 0.0 ? new ceres::SoftLOneLoss(options.loss_scale)
-                                 : nullptr;
     problem.AddResidualBlock(
         new ReprojectionCost(camera.model_id, camera.params.size(),
                              observation.xy),
@@ -722,14 +779,35 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
         camera_blocks.at(image.camera_id).data());
   }
 
-  ceres::Solver::Options solver_options;
-  solver_options.max_num_iterations = options.max_num_iterations;
-  solver_options.linear_solver_type = ceres::DENSE_SCHUR;
-  solver_options.minimizer_progress_to_stdout = false;
-  solver_options.num_threads = parallel::getNumThreads();
+  const ceres::Solver::Options solver_options = bundle_internal::CreateSolverOptions(
+      options.solver, options.max_num_iterations, local_image_ids.size(), problem);
+  summary.requested_linear_solver_type = ceres::LinearSolverTypeToString(solver_options.linear_solver_type);
+  summary.solver_num_threads = solver_options.num_threads;
+  summary.num_scalar_residuals = problem.NumResiduals();
 
   ceres::Solver::Summary solver_summary;
+  VLOG(1) << "Local BA begin: root=" << root_image_id
+          << " threads=" << solver_options.num_threads
+          << " images=" << pose_blocks.size()
+          << " points=" << point_blocks.size()
+          << " variable_points=" << summary.num_variable_points
+          << " constant_points=" << summary.num_constant_points
+          << " observations=" << observations.size();
   ceres::Solve(solver_options, &problem, &solver_summary);
+  VLOG(1) << "Local BA end: root=" << root_image_id << " "
+          << solver_summary.BriefReport()
+          << " unsuccessful_steps=" << solver_summary.num_unsuccessful_steps
+          << " jacobian_seconds=" << solver_summary.jacobian_evaluation_time_in_seconds
+          << " residual_seconds=" << solver_summary.residual_evaluation_time_in_seconds
+          << " linear_solver_seconds=" << solver_summary.linear_solver_time_in_seconds;
+  bundle_internal::RecordSolverSummary(solver_summary, &summary);
+  summary.success = bundle_internal::CanCommitSolution(
+      solver_summary, pose_blocks, point_blocks, camera_blocks);
+  if (!summary.success) {
+    summary.final_mean_reprojection_error = summary.initial_mean_reprojection_error;
+    summary.message += "; reconstruction unchanged (unusable or non-finite solution)";
+    return summary;
+  }
 
   for (const auto& [image_id, block] : pose_blocks) {
     Image& image = reconstruction->GetImage(image_id);
@@ -744,8 +822,6 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
 
   summary.final_mean_reprojection_error =
       MeanReprojectionError(*reconstruction, observations);
-  summary.success = solver_summary.IsSolutionUsable();
-  summary.message = solver_summary.BriefReport();
   return summary;
 }
 

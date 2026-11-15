@@ -208,6 +208,33 @@ TEST(LocalBundleAdjusterTest,
   EXPECT_GT(summary.num_residuals, 2U * (10U + 6U));
 }
 
+TEST(LocalBundleAdjusterTest, KeepsIncompletelyObservedPointsFixed) {
+  const Camera camera = MakeCamera();
+  const std::map<ImageId, Pose3> poses = {
+      {1, CameraAt(Eigen::Vector3d::Zero())},
+      {2, CameraAt(Eigen::Vector3d(1, 0, 0))},
+      {3, CameraAt(Eigen::Vector3d(0, 1, 0))}};
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  for (const auto& [id, pose] : poses) reconstruction.AddImage(MakeImage(id, pose));
+  for (const auto& point : MakeScenePoints()) {
+    AddTrackedPoint(&reconstruction, camera, poses, point, {1, 2});
+  }
+  AddTrackedPoint(&reconstruction, camera, poses, Eigen::Vector3d(.2, .3, 5), {1, 3});
+  const auto id = reconstruction.GetImage(3).points2d.back().point3d_id;
+  auto& point = reconstruction.GetPoint3D(id);
+  point.xyz += Eigen::Vector3d(.1, .1, .2);
+  const Eigen::Vector3d before = point.xyz;
+  LocalBundleAdjustmentOptions options;
+  options.max_num_images = 2;
+  options.max_num_fixed_images = 0;
+  const auto summary = AdjustLocalBundle(1, options, &reconstruction);
+  ASSERT_TRUE(summary.success) << summary.message;
+  EXPECT_TRUE(summary.fixed_image_ids.empty());
+  EXPECT_EQ(summary.num_constant_points, 1U);
+  EXPECT_EQ(reconstruction.GetPoint3D(id).xyz, before);
+}
+
 TEST(LocalBundleAdjusterTest,
      KeepsSharedCameraIntrinsicsConstantWhenBundleIsIncomplete) {
   const Camera true_camera = MakeCamera();
@@ -285,6 +312,78 @@ TEST(LocalBundleAdjusterTest,
   EXPECT_TRUE(summary.success);
   EXPECT_EQ(summary.num_constant_cameras, 0U);
   EXPECT_EQ(summary.num_variable_cameras, 1U);
+}
+
+TEST(LocalBundleAdjusterTest, ScopedChangesKeepCompleteExternalConstraints) {
+  const Camera camera = MakeCamera();
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  std::map<ImageId, Pose3> poses;
+  for (ImageId id = 1; id <= 4; ++id) {
+    poses[id] = CameraAt(Eigen::Vector3d(0.5 * (id - 1), 0, 0));
+    reconstruction.AddImage(MakeImage(id, poses[id]));
+  }
+  LocalBundleAdjustmentScope scope;
+  std::map<Point3DId, Eigen::Vector3d> stable_points;
+  for (const auto& xyz : MakeScenePoints()) {
+    AddTrackedPoint(&reconstruction, camera, poses, xyz, {1, 2, 3, 4});
+    const auto stable_id = reconstruction.NextPoint3DId() - 1;
+    auto& stable = reconstruction.GetPoint3D(stable_id);
+    stable.xyz += Eigen::Vector3d(0.01, -0.01, 0.02);
+    stable_points[stable_id] = stable.xyz;
+    AddTrackedPoint(&reconstruction, camera, poses, xyz, {1, 2, 3, 4});
+    const auto modified_id = reconstruction.NextPoint3DId() - 1;
+    scope.modified_point_ids.insert(modified_id);
+    reconstruction.GetPoint3D(modified_id).xyz += Eigen::Vector3d(0.02, 0.01, 0.03);
+    AddTrackedPoint(&reconstruction, camera, poses, xyz, {1, 2});
+  }
+  LocalBundleAdjustmentOptions options;
+  options.max_num_images = 2;
+  options.max_num_fixed_images = 0;
+  options.refine_poses = false;
+  options.refine_camera_params = CameraParameterGroup::kFocalLength;
+  const auto summary = AdjustLocalBundle(1, options, &reconstruction, &scope);
+  ASSERT_TRUE(summary.success) << summary.message;
+  EXPECT_EQ(summary.local_image_ids, (std::set<ImageId>{1, 2}));
+  EXPECT_EQ(summary.fixed_image_ids, (std::set<ImageId>{3, 4}));
+  EXPECT_EQ(summary.num_variable_points, 60U);
+  EXPECT_EQ(summary.num_constant_points, 30U);
+  EXPECT_EQ(summary.num_residuals, 240U);
+  EXPECT_EQ(summary.num_variable_cameras, 0U);
+  EXPECT_EQ(reconstruction.GetCamera(1).params, camera.params);
+  for (const auto& [id, xyz] : stable_points) {
+    EXPECT_EQ(reconstruction.GetPoint3D(id).xyz, xyz);
+  }
+  EXPECT_LT(summary.final_mean_reprojection_error,
+            summary.initial_mean_reprojection_error);
+}
+
+TEST(LocalBundleAdjusterTest, ScopedLongTracksVaryOnlyWhenNew) {
+  const Camera camera = MakeCamera();
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  std::map<ImageId, Pose3> poses;
+  std::vector<ImageId> image_ids;
+  for (ImageId id = 1; id <= 17; ++id) {
+    poses[id] = CameraAt(Eigen::Vector3d(0.1 * (id - 1), 0, 0));
+    reconstruction.AddImage(MakeImage(id, poses[id]));
+    image_ids.push_back(id);
+  }
+  const auto xyz = Eigen::Vector3d(0.2, -0.1, 5.0);
+  AddTrackedPoint(&reconstruction, camera, poses, xyz, image_ids);
+  LocalBundleAdjustmentScope scope;
+  scope.first_new_point_id = reconstruction.NextPoint3DId();
+  AddTrackedPoint(&reconstruction, camera, poses, xyz, image_ids);
+  scope.modified_point_ids = {1, 2};
+  LocalBundleAdjustmentOptions options;
+  options.max_num_images = 2;
+  options.refine_poses = false;
+  const auto summary = AdjustLocalBundle(1, options, &reconstruction, &scope);
+  ASSERT_TRUE(summary.success) << summary.message;
+  EXPECT_EQ(summary.num_variable_points, 1U);
+  EXPECT_EQ(summary.num_constant_points, 1U);
+  EXPECT_EQ(summary.num_residuals, 19U);
+  EXPECT_EQ(summary.fixed_image_ids.size(), 15U);
 }
 
 }  // namespace

@@ -1,4 +1,5 @@
 #include "colite/features/sift_extractor.h"
+#include "colite/io/image_reader.h"
 
 #include <algorithm>
 #include <array>
@@ -24,7 +25,6 @@ namespace colite {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-constexpr double kDefaultOpenCvContrastThreshold = 0.04;
 #if defined(COLITE_ENABLE_AVX2)
 constexpr bool kUseAvx2 = true;
 #else
@@ -73,15 +73,6 @@ std::vector<float> GrayToFloatVector(const cv::Mat& gray,
   return result;
 }
 
-double EffectiveVlSiftPeakThreshold(const SiftExtractionOptions& options) {
-  // COLMAP CPU SIFT 的 peak_threshold 默认是 0.02 / octave_resolution。
-  if (std::abs(options.contrast_threshold -
-               kDefaultOpenCvContrastThreshold) < 1e-12) {
-    return 0.02 / static_cast<double>(options.num_octave_layers);
-  }
-  return options.contrast_threshold;
-}
-
 void TransformVlFeatDescriptorToUbc(float* descriptor) {
   std::array<float, VL_SIFT_DESCR_LEN> vlfeat_descriptor = {};
   std::copy(descriptor, descriptor + VL_SIFT_DESCR_LEN,
@@ -111,11 +102,13 @@ FeatureSet ExtractCvSiftFeatures(const cv::Mat& gray,
   features::backends::Sift sift =
       features::backends::Sift::create(options.max_num_features,
                                        options.num_octave_layers,
-                                       options.contrast_threshold,
+                                       options.peak_threshold * options.num_octave_layers,
                                        options.edge_threshold,
                                        options.sigma,
                                        false,
                                        kUseAvx2);
+  sift.setGeometryLimits(options.upsample_first_octave ? -1 : 0,
+                         options.num_octaves, options.max_num_orientations);
   std::vector<features::backends::KeyPoint> keypoints;
   std::vector<float> descriptors;
   sift.detectAndCompute(image.data(), gray.cols, gray.rows, keypoints,
@@ -125,9 +118,9 @@ FeatureSet ExtractCvSiftFeatures(const cv::Mat& gray,
   result.keypoints.reserve(keypoints.size());
   for (const features::backends::KeyPoint& keypoint : keypoints) {
     FeatureKeypoint converted;
-    converted.x = keypoint.x;
-    converted.y = keypoint.y;
-    converted.scale = keypoint.size;
+    converted.x = keypoint.x + 0.5F;
+    converted.y = keypoint.y + 0.5F;
+    converted.scale = keypoint.size * 0.5F;
     converted.orientation = keypoint.angle;
     converted.response = keypoint.response;
     result.keypoints.push_back(converted);
@@ -137,6 +130,9 @@ FeatureSet ExtractCvSiftFeatures(const cv::Mat& gray,
   }
   result.descriptors = features::ConvertSiftDescriptors(
       descriptors.data(), keypoints.size(), options.use_root_sift);
+  result.descriptor_normalization =
+      options.use_root_sift ? DescriptorNormalization::kRootL1
+                            : DescriptorNormalization::kL2;
   return result;
 }
 
@@ -145,12 +141,12 @@ FeatureSet ExtractVlSiftFeatures(const cv::Mat& gray,
   const std::vector<float> image = GrayToFloatVector(gray, 1.0 / 255.0);
   const int first_octave = options.upsample_first_octave ? -1 : 0;
   VlSiftFilt* filter =
-      vl_sift_new(gray.cols, gray.rows, options.vl_num_octaves,
+      vl_sift_new(gray.cols, gray.rows, options.num_octaves,
                   options.num_octave_layers, first_octave);
   if (filter == nullptr) {
     throw std::runtime_error("Failed to create VL SIFT filter.");
   }
-  vl_sift_set_peak_thresh(filter, EffectiveVlSiftPeakThreshold(options));
+  vl_sift_set_peak_thresh(filter, options.peak_threshold);
   vl_sift_set_edge_thresh(filter, options.edge_threshold);
 
   std::vector<VlSiftLevelFeatures> levels;
@@ -272,6 +268,9 @@ FeatureSet ExtractVlSiftFeatures(const cv::Mat& gray,
   }
   result.descriptors = features::ConvertSiftDescriptors(
       descriptors.data(), result.keypoints.size(), options.use_root_sift);
+  result.descriptor_normalization =
+      options.use_root_sift ? DescriptorNormalization::kRootL1
+                            : DescriptorNormalization::kL2;
   return result;
 }
 
@@ -325,12 +324,37 @@ SiftBackend ResolveSiftBackend(const SiftBackend requested) {
   if (requested != SiftBackend::kAuto) {
     return requested;
   }
-  return IsCudaSiftAvailable() ? SiftBackend::kCudaSift
-                               : SiftBackend::kCvSift;
+  return IsCudaSiftAvailable() ? SiftBackend::kCudaVlSift
+                               : SiftBackend::kVlSift;
 }
 
 FeatureSet ExtractSiftFeatures(const cv::Mat& image,
                                const SiftExtractionOptions& options) {
+  if (options.num_octave_layers <= 0 || options.num_octaves == 0 || options.num_octaves < -1 ||
+      options.max_num_orientations <= 0 || options.max_num_orientations > 4 ||
+      !std::isfinite(options.peak_threshold) || options.peak_threshold < 0.0 ||
+      !std::isfinite(options.edge_threshold) || options.edge_threshold <= 0.0 ||
+      !std::isfinite(options.sigma) || options.sigma <= 0.0) {
+    throw std::invalid_argument("Invalid SIFT scale-space or threshold options");
+  }
+  if (options.max_image_size > 0 &&
+      std::max(image.cols, image.rows) > options.max_image_size) {
+    const double ratio = static_cast<double>(options.max_image_size) / std::max(image.cols, image.rows);
+    cv::Mat resized;
+    cv::resize(image, resized, cv::Size(std::max(1, static_cast<int>(std::round(image.cols * ratio))),
+                                     std::max(1, static_cast<int>(std::round(image.rows * ratio)))), 0, 0, cv::INTER_AREA);
+    auto nested = options;
+    nested.max_image_size = 0;
+    FeatureSet features = ExtractSiftFeatures(resized, nested);
+    const float sx = static_cast<float>(image.cols) / resized.cols;
+    const float sy = static_cast<float>(image.rows) / resized.rows;
+    for (auto& keypoint : features.keypoints) {
+      keypoint.x *= sx;
+      keypoint.y *= sy;
+      keypoint.scale *= (sx + sy) * 0.5F;
+    }
+    return features;
+  }
   const cv::Mat gray = ToGrayImage(image);
   const SiftBackend backend = ResolveSiftBackend(options.backend);
   switch (backend) {
@@ -349,9 +373,22 @@ FeatureSet ExtractSiftFeatures(const cv::Mat& image,
 
 FeatureSet ExtractSiftFeaturesFromFile(const std::filesystem::path& image_path,
                                        const SiftExtractionOptions& options) {
-  const cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_COLOR);
+  cv::Mat image = ReadImageWithExifOrientation(image_path,
+                                                      cv::IMREAD_COLOR);
   if (image.empty()) {
     throw std::runtime_error("Failed to read image: " + image_path.string());
+  }
+  const auto backend = ResolveSiftBackend(options.backend);
+  if ((backend == SiftBackend::kCudaSift || backend == SiftBackend::kCudaVlSift) &&
+      (options.max_image_size <= 0 ||
+       std::max(image.cols, image.rows) <= options.max_image_size)) {
+    // Preserve the BGR-to-gray conversion exactly, but release color pixels
+    // before the GPU pipeline starts. Resized inputs keep their original
+    // resize-then-grayscale order in ExtractSiftFeatures.
+    cv::Mat gray;
+    cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+    image.release();
+    return ExtractSiftFeatures(gray, options);
   }
   return ExtractSiftFeatures(image, options);
 }

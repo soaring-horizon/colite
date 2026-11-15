@@ -51,6 +51,10 @@ bool MvsImageWorkspace::IsCached(ImageId image_id) const {
   return cache_.find(image_id) != cache_.end();
 }
 
+MvsImage MvsImageWorkspace::ReadImage(ImageId image_id) const {
+  return LoadImage(image_id);
+}
+
 std::size_t MvsImageWorkspace::NumCachedImages() const {
   return cache_.size();
 }
@@ -66,6 +70,10 @@ MvsImage MvsImageWorkspace::LoadImage(ImageId image_id) const {
     throw std::invalid_argument("MVS image must exist and be registered.");
   }
   const Image& image = reconstruction_.GetImage(image_id);
+  const Camera& camera = reconstruction_.GetCamera(image.camera_id);
+  if (camera.width == 0 || camera.height == 0) {
+    throw std::invalid_argument("MVS camera dimensions must be positive.");
+  }
   const std::filesystem::path image_path = ResolveImagePath(image);
 
   if (!options_.load_gray && !options_.load_color) {
@@ -96,16 +104,18 @@ MvsImage MvsImageWorkspace::LoadImage(ImageId image_id) const {
   cv::Mat resized_u8 = gray_u8;
   cv::Mat resized_color_bgr = color_bgr;
   if (options_.max_image_size > 0) {
-    const int max_dimension = std::max(original_width, original_height);
+    const int max_dimension = std::max(camera.width, camera.height);
     scale = std::min(scale,
                      static_cast<double>(options_.max_image_size) /
                          static_cast<double>(max_dimension));
   }
-  if (scale < 1.0) {
-    const int new_width =
-        std::max(1, static_cast<int>(std::round(original_width * scale)));
-    const int new_height =
-        std::max(1, static_cast<int>(std::round(original_height * scale)));
+  // COLMAP workspaces can contain resized bitmaps while sparse cameras keep
+  // their original dimensions (notably undistorted PINHOLE inputs).
+  const int new_width =
+      std::max(1, static_cast<int>(std::round(camera.width * scale)));
+  const int new_height =
+      std::max(1, static_cast<int>(std::round(camera.height * scale)));
+  if (new_width != original_width || new_height != original_height) {
     if (options_.load_gray) {
       cv::resize(gray_u8, resized_u8, cv::Size(new_width, new_height), 0.0,
                  0.0, cv::INTER_AREA);
@@ -119,7 +129,7 @@ MvsImage MvsImageWorkspace::LoadImage(ImageId image_id) const {
   MvsImage result;
   result.image_id = image_id;
   result.name = image.name;
-  result.scale = scale;
+  result.scale = static_cast<double>(new_width) / camera.width;
   if (options_.load_gray) {
     resized_u8.convertTo(result.gray, CV_32FC1, 1.0 / 255.0);
   }

@@ -53,6 +53,9 @@ class MvsImageWorkspace {
                     MvsImageWorkspaceOptions options);
 
   const MvsImage& GetImage(ImageId image_id);
+  // Independent reads do not touch the LRU and may run concurrently. Useful
+  // when a caller already owns a bounded cache of complete stereo views.
+  MvsImage ReadImage(ImageId image_id) const;
   bool IsCached(ImageId image_id) const;
   std::size_t NumCachedImages() const;
   void ClearCache();

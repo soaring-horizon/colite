@@ -1,6 +1,8 @@
 #include "colite/controllers/sequential_matcher.h"
+#include "colite/core/progress.h"
 
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <map>
@@ -15,10 +17,13 @@
 #include <glog/logging.h>
 
 #include "colite/core/parallel.h"
+#include "colite/core/memory.h"
 #include "colite/io/sfm_workspace.h"
+#include "colite/controllers/sfm_options.h"
 #include "colite/matching/two_view_geometry_batch.h"
 #include "colite/matching/match_graph_consistency.h"
 #include "colite/matching/weak_pair_rematcher.h"
+#include "colite/matching/sift_matching_pipeline.h"
 
 namespace colite::controllers {
 namespace {
@@ -33,6 +38,8 @@ std::string MatchingStrategyName(MatchingStrategy strategy) {
       return "spatial";
     case MatchingStrategy::kVocabTree:
       return "vocab_tree";
+    case MatchingStrategy::kTransitive:
+      return "transitive";
   }
   return "unknown";
 }
@@ -97,10 +104,12 @@ std::vector<std::pair<std::string, std::string>> RawMatchCacheEntries(
     const std::vector<Image>& images,
     const std::string& feature_hash) {
   return {{"stage", "matches"},
+          {"algorithm_version", "typed_matcher_v2_transitive"},
           {"feature_hash", feature_hash},
           {"num_images", std::to_string(images.size())},
           {"matching_strategy", MatchingStrategyName(options.matching_strategy)},
           {"overlap", std::to_string(options.overlap)},
+          {"quadratic_overlap", options.quadratic_overlap ? "1" : "0"},
           {"spatial_max_num_neighbors",
            std::to_string(options.spatial_max_num_neighbors)},
           {"spatial_max_distance", ToConfigValue(options.spatial_max_distance)},
@@ -117,8 +126,25 @@ std::vector<std::pair<std::string, std::string>> RawMatchCacheEntries(
           {"vocab_tree_sequential_overlap",
            std::to_string(options.vocab_tree_sequential_overlap)},
           {"vocab_tree_path", options.vocab_tree_path.lexically_normal().string()},
+          {"transitive_max_path_length",
+           std::to_string(options.transitive_max_path_length)},
+          {"transitive_max_num_neighbors",
+           std::to_string(options.transitive_max_num_neighbors)},
           {"matcher_backend", MatcherBackendName(options.matcher_backend)},
+          {"matcher_type", std::to_string(static_cast<int>(options.matcher_type))},
+          {"learned_matcher_model_path",
+           options.learned_matcher_model_path.lexically_normal().string()},
+          {"min_cosine_similarity", ToConfigValue(options.min_cosine_similarity)},
+          {"lightglue_min_score", ToConfigValue(options.lightglue_min_score)},
+          {"learned_execution_provider",
+           std::to_string(static_cast<int>(options.learned_execution_provider))},
+          {"learned_gpu_index", std::to_string(options.learned_gpu_index)},
+          {"learned_cuda_memory_limit_mb",
+           std::to_string(options.learned_cuda_memory_limit_mb)},
+          {"learned_use_io_binding",
+           options.learned_use_io_binding ? "1" : "0"},
           {"max_ratio", ToConfigValue(options.max_ratio)},
+          {"max_distance", ToConfigValue(options.max_distance)},
           {"mutual_check", options.mutual_check ? "1" : "0"}};
 }
 
@@ -127,16 +153,17 @@ std::vector<std::pair<std::string, std::string>> GeometryCacheEntries(
     const std::string& raw_match_hash) {
   return {{"stage", "geometry"},
           {"raw_match_hash", raw_match_hash},
+          {"two_view_geometry", SfmGeometryKey(options.two_view_geometry)},
           {"guided_matching", options.guided_matching ? "1" : "0"},
           {"guided_match_ratio", ToConfigValue(options.guided_match_ratio)},
           {"guided_min_inlier_gain",
            std::to_string(options.guided_min_inlier_gain)},
           {"keep_degenerate", "1"},
           {"algorithm_version",
-           "five_point_adaptive_lo_ransac_consistent_tracks_v4"},
-          {"min_num_iterations", "100"},
-          {"max_num_iterations", "10000"},
-          {"confidence", "0.999"}};
+           "two_view_colmap4_v10_guided_geometry"},
+          {"min_num_iterations", std::to_string(options.two_view_geometry.min_num_iterations)},
+          {"max_num_iterations", std::to_string(options.two_view_geometry.max_num_iterations)},
+          {"confidence", SfmNumberKey(options.two_view_geometry.confidence)}};
 }
 
 std::optional<std::size_t> ReadCacheSizeValue(
@@ -160,15 +187,34 @@ std::optional<std::size_t> ReadCacheSizeValue(
 
 SequentialMatcherController::SequentialMatcherController(
     SequentialMatcherControllerOptions options)
-    : options_(std::move(options)) {}
+    : options_(std::move(options)) {
+  if (options_.matcher_type == FeatureMatcherType::kSiftBruteForce && options_.execution.use_gpu.has_value())
+    options_.matcher_backend = ResolveSfmMatchingBackend(options_.execution);
+  if (options_.matcher_type == FeatureMatcherType::kAlikedBruteForce && options_.execution.use_gpu.value_or(false))
+    throw std::invalid_argument("ALIKED_BRUTEFORCE currently supports FeatureMatching.use_gpu=0 only");
+  if (options_.execution.use_gpu.has_value()) options_.learned_execution_provider =
+      *options_.execution.use_gpu ? OnnxExecutionProvider::kCuda : OnnxExecutionProvider::kCpu;
+  options_.learned_gpu_index = std::max(0, options_.execution.gpu_index);
+}
 
 SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
+  options_.two_view_geometry.Check();
+  struct ThreadScope {
+    int previous = parallel::getNumThreads();
+    explicit ThreadScope(int requested) { parallel::setNumThreads(requested); }
+    ~ThreadScope() { parallel::setNumThreads(previous); }
+  } threads(options_.execution.num_threads);
   SequentialMatcherControllerSummary summary;
   const std::vector<Camera> cameras =
       ReadWorkspaceCameras(options_.workspace_path);
   const std::vector<Image> images = ReadWorkspaceImages(options_.workspace_path);
   if (cameras.empty() || images.size() < 2) {
     throw std::runtime_error("Workspace must contain at least two images");
+  }
+  if (options_.matcher_type != FeatureMatcherType::kSiftBruteForce &&
+      options_.guided_matching) {
+    throw std::invalid_argument(
+        "Guided descriptor re-search currently requires the SIFT brute-force matcher");
   }
   LOG(INFO) << "Matching: images=" << images.size()
             << " strategy=" << MatchingStrategyName(options_.matching_strategy)
@@ -178,11 +224,38 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
             << " guided_ratio=" << options_.guided_match_ratio;
 
   MatchGraph graph;
-  ReadWorkspaceFeatureSets(options_.workspace_path, &graph);
+  PreparedFeatureMatcherCache prepared_features;
+  using Clock = std::chrono::steady_clock;
+  auto elapsed = [](Clock::time_point start) { return std::chrono::duration<double>(Clock::now() - start).count(); };
+  const auto load_start = Clock::now();
+  if (options_.matcher_type == FeatureMatcherType::kSiftBruteForce &&
+      options_.matching_strategy != MatchingStrategy::kVocabTree) {
+    // SIFT matching consumes quantized descriptors. Prepare one image at a
+    // time so the entire float workspace and the byte cache never coexist.
+    // Vocabulary retrieval still needs the original descriptor matrices.
+    for (const Image& image : images) {
+      FeatureSet features = ReadWorkspaceFeatureSet(options_.workspace_path, image.id);
+      const auto prepare_start = Clock::now();
+      prepared_features.emplace(image.id, std::make_unique<PreparedFeatureMatcher>(
+          features, options_.matcher_backend));
+      summary.descriptor_preparation_seconds += elapsed(prepare_start);
+      features.descriptors.resize(0, 0);
+      graph.features.emplace(image.id, std::move(features));
+    }
+  } else {
+    ReadWorkspaceFeatureSets(options_.workspace_path, &graph);
+  }
+  summary.feature_loading_seconds = elapsed(load_start) - summary.descriptor_preparation_seconds;
+  if (options_.matching_strategy == MatchingStrategy::kTransitive) {
+    ReadWorkspaceMatches(options_.workspace_path, &graph);
+    ReadWorkspaceVerifiedGeometries(options_.workspace_path, &graph);
+  }
 
   DescriptorMatchingOptions matching_options;
   matching_options.backend = options_.matcher_backend;
+  matching_options.matcher_type = options_.matcher_type;
   matching_options.max_ratio = options_.max_ratio;
+  matching_options.max_distance = options_.max_distance;
   matching_options.mutual_check = options_.mutual_check;
 
   const std::string feature_hash =
@@ -191,10 +264,24 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
       StableConfigHash(RawMatchCacheEntries(options_, images, feature_hash));
   const std::string geometry_hash =
       StableConfigHash(GeometryCacheEntries(options_, raw_match_hash));
+  const bool geometry_cache_valid = WorkspaceCacheIsValid(
+      options_.workspace_path, "geometry", geometry_hash);
+
+  std::map<ImageId, Camera> cameras_by_image;
+  for (const Image& image : images) {
+    const auto camera_it = std::find_if(
+        cameras.begin(), cameras.end(),
+        [&](const Camera& camera) { return camera.id == image.camera_id; });
+    if (camera_it == cameras.end()) {
+      throw std::runtime_error("Workspace image references missing camera");
+    }
+    cameras_by_image.emplace(image.id, *camera_it);
+  }
 
   MatchingPairGeneratorOptions pair_options;
   pair_options.strategy = options_.matching_strategy;
   pair_options.sequential_overlap = options_.overlap;
+  pair_options.sequential_quadratic_overlap = options_.quadratic_overlap;
   pair_options.spatial_max_num_neighbors = options_.spatial_max_num_neighbors;
   pair_options.spatial_max_distance = options_.spatial_max_distance;
   pair_options.vocab_tree_num_images = options_.vocab_tree_num_images;
@@ -207,6 +294,10 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
   pair_options.vocab_tree_sequential_overlap =
       options_.vocab_tree_sequential_overlap;
   pair_options.vocab_tree_path = options_.vocab_tree_path;
+  pair_options.transitive_max_path_length =
+      options_.transitive_max_path_length;
+  pair_options.transitive_max_num_neighbors =
+      options_.transitive_max_num_neighbors;
 
   if (const auto cached_num_pairs = ReadCacheSizeValue(
           options_.workspace_path, "matches", raw_match_hash, "pairs")) {
@@ -244,46 +335,137 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
         GenerateMatchingPairs(images, graph, pair_options,
                               &summary.pair_generation);
 
-    std::map<ImageId, std::size_t> prepared_indices;
+    const auto prepare_start = Clock::now();
     std::vector<std::unique_ptr<PreparedFeatureMatcher>> prepared(images.size());
-    for (std::size_t image_idx = 0; image_idx < images.size(); ++image_idx) {
-      prepared_indices.emplace(images[image_idx].id, image_idx);
-    }
-    parallel::parallel_for_(
-        parallel::Range(0, static_cast<int>(images.size())),
-        [&](const parallel::Range& range) {
-          for (int image_idx = range.start; image_idx < range.end; ++image_idx) {
-            const FeatureSet* features =
-                FindFeatures(graph, images[static_cast<std::size_t>(image_idx)].id);
-            if (features == nullptr) {
-              throw std::runtime_error("Workspace features are incomplete");
+    if (options_.matcher_type == FeatureMatcherType::kSiftBruteForce &&
+        prepared_features.empty()) {
+      parallel::parallel_for_(
+          parallel::Range(0, static_cast<int>(images.size())),
+          [&](const parallel::Range& range) {
+            for (int image_idx = range.start; image_idx < range.end; ++image_idx) {
+              const FeatureSet* features = FindFeatures(
+                  graph, images[static_cast<std::size_t>(image_idx)].id);
+              if (features == nullptr) {
+                throw std::runtime_error("Workspace features are incomplete");
+              }
+              prepared[static_cast<std::size_t>(image_idx)] =
+                  std::make_unique<PreparedFeatureMatcher>(
+                      *features, matching_options.backend);
             }
-            prepared[static_cast<std::size_t>(image_idx)] =
-                std::make_unique<PreparedFeatureMatcher>(
-                    *features, matching_options.backend);
-          }
-        });
+          });
+      for (std::size_t idx = 0; idx < images.size(); ++idx) {
+        prepared_features.emplace(images[idx].id, std::move(prepared[idx]));
+      }
+    }
 
+    summary.descriptor_preparation_seconds += elapsed(prepare_start);
+    const auto match_start = Clock::now();
     std::vector<std::vector<FeatureMatch>> pair_matches(pairs.size());
-    parallel::parallel_for_(
-        parallel::Range(0, static_cast<int>(pairs.size())),
-        [&](const parallel::Range& range) {
-          for (int pair_idx = range.start; pair_idx < range.end; ++pair_idx) {
-            const ImagePair& pair = pairs[static_cast<std::size_t>(pair_idx)];
-            pair_matches[static_cast<std::size_t>(pair_idx)] =
-                MatchPreparedFeatureSets(
-                    *prepared.at(prepared_indices.at(pair.image_id1)),
-                    *prepared.at(prepared_indices.at(pair.image_id2)),
-                    matching_options);
-          }
-        });
-    for (std::size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
-      const ImagePair& pair = pairs[pair_idx];
-      SetMatches(&graph, pair.image_id1, pair.image_id2,
-                 pair_matches[pair_idx]);
+    if (options_.matcher_type == FeatureMatcherType::kSiftBruteForce &&
+        options_.matcher_backend == DescriptorMatcherBackend::kCudaBruteForce &&
+        !geometry_cache_valid) {
+      SiftMatchingPipelineOptions pipeline_options;
+      pipeline_options.retain_matches = false;
+      pipeline_options.matching = matching_options;
+      pipeline_options.geometry.keep_degenerate = true;
+      pipeline_options.geometry.geometry_options = options_.two_view_geometry;
+      pipeline_options.guided_matching = options_.guided_matching;
+      pipeline_options.guided.nearby_image_window = 0;
+      pipeline_options.guided.min_inlier_gain = options_.guided_min_inlier_gain;
+      pipeline_options.guided.relaxed_matching = matching_options;
+      pipeline_options.guided.relaxed_matching.max_ratio = options_.guided_match_ratio;
+      pipeline_options.guided.guided_matching.max_sampson_error_px = options_.two_view_geometry.max_error_px;
+      std::vector<ImageId> image_ids;
+      for (const auto& image : images) image_ids.push_back(image.id);
+      const auto pipeline = RunSiftMatchingPipeline(
+          image_ids, pairs, cameras_by_image, prepared_features, pipeline_options,
+          &graph, &pair_matches);
+      summary.frontend_pipeline_used = true;
+      summary.frontend_pipeline_seconds = pipeline.wall_seconds;
+      summary.descriptor_matching_seconds = pipeline.matching_work_seconds;
+      summary.geometry_verification_seconds = pipeline.geometry_work_seconds;
+      summary.guided_matching_seconds = pipeline.guided_work_seconds;
+      summary.guided_matching = pipeline.guided;
+    } else {
+      ProgressCounter progress("descriptor_matching", pairs.size());
+      parallel::parallel_for_(
+          parallel::Range(0, static_cast<int>(pairs.size())),
+          [&](const parallel::Range& range) {
+            const ScopedLightGlueThreadCache inference_cache_scope;
+            for (int pair_idx = range.start; pair_idx < range.end; ++pair_idx) {
+              const ImagePair& pair = pairs[static_cast<std::size_t>(pair_idx)];
+              if (options_.matcher_type ==
+                  FeatureMatcherType::kSiftBruteForce) {
+                pair_matches[static_cast<std::size_t>(pair_idx)] =
+                    MatchPreparedFeatureSets(
+                        *prepared_features.at(pair.image_id1),
+                        *prepared_features.at(pair.image_id2),
+                        matching_options);
+              } else {
+                const FeatureSet* features1 = FindFeatures(graph, pair.image_id1);
+                const FeatureSet* features2 = FindFeatures(graph, pair.image_id2);
+                if (features1 == nullptr || features2 == nullptr) {
+                  throw std::runtime_error("Workspace features are incomplete");
+                }
+                if (options_.matcher_type ==
+                    FeatureMatcherType::kAlikedBruteForce) {
+                  CosineMatchingOptions learned_options;
+                  learned_options.min_cosine_similarity =
+                      static_cast<float>(options_.min_cosine_similarity);
+                  learned_options.max_ratio =
+                      static_cast<float>(options_.max_ratio);
+                  learned_options.mutual_check = options_.mutual_check;
+                  pair_matches[static_cast<std::size_t>(pair_idx)] =
+                      MatchAlikedDescriptors(*features1, *features2,
+                                             learned_options);
+                } else {
+                  LightGlueMatchingOptions learned_options;
+                  learned_options.matcher_type = options_.matcher_type;
+                  learned_options.model_path =
+                      options_.learned_matcher_model_path;
+                  learned_options.min_score =
+                      static_cast<float>(options_.lightglue_min_score);
+                  learned_options.num_threads =
+                      options_.learned_matcher_num_threads;
+                  learned_options.execution_provider =
+                      options_.learned_execution_provider;
+                  learned_options.gpu_index = options_.learned_gpu_index;
+                  learned_options.cuda_memory_limit_mb =
+                      options_.learned_cuda_memory_limit_mb;
+                  learned_options.use_io_binding =
+                      options_.learned_use_io_binding;
+                  const Camera& camera1 = cameras_by_image.at(pair.image_id1);
+                  const Camera& camera2 = cameras_by_image.at(pair.image_id2);
+                  pair_matches[static_cast<std::size_t>(pair_idx)] =
+                      MatchFeatureSetsLightGlue(
+                          *features1, static_cast<int>(camera1.width),
+                          static_cast<int>(camera1.height), *features2,
+                          static_cast<int>(camera2.width),
+                          static_cast<int>(camera2.height), learned_options);
+                }
+              }
+              progress.Advance();
+            }
+          });
+      for (std::size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
+        const ImagePair& pair = pairs[pair_idx];
+        SetMatches(&graph, pair.image_id1, pair.image_id2,
+                   pair_matches[pair_idx]);
+      }
+      summary.descriptor_matching_seconds = elapsed(match_start);
     }
     summary.num_pairs = pairs.size();
-    WriteWorkspaceMatches(options_.workspace_path, graph);
+    const auto raw_write_start = Clock::now();
+    if (summary.frontend_pipeline_used) {
+      MatchGraph raw_graph;
+      for (std::size_t i = 0; i < pairs.size(); ++i) {
+        raw_graph.matches.emplace(pairs[i], std::move(pair_matches[i]));
+      }
+      WriteWorkspaceMatches(options_.workspace_path, raw_graph);
+    } else {
+      WriteWorkspaceMatches(options_.workspace_path, graph);
+    }
+    summary.workspace_write_seconds += elapsed(raw_write_start);
     WriteWorkspaceCacheMetadata(options_.workspace_path, "matches",
                                 raw_match_hash,
                                 {{"pairs", std::to_string(summary.num_pairs)},
@@ -295,23 +477,13 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
                                  {"min_degree", std::to_string(summary.pair_generation.min_degree)},
                                  {"max_degree", std::to_string(summary.pair_generation.max_degree)},
                                  {"mean_degree", ToConfigValue(summary.pair_generation.mean_degree)}},
-                                {"matches/raw_matches.tsv"});
+                                {"matches/raw_matches.tsv", "features", "cameras.txt", "images.tsv"});
   }
 
-  std::map<ImageId, Camera> cameras_by_image;
-  for (const Image& image : images) {
-    const auto camera_it = std::find_if(
-        cameras.begin(), cameras.end(),
-        [&](const Camera& camera) { return camera.id == image.camera_id; });
-    if (camera_it == cameras.end()) {
-      throw std::runtime_error("Workspace image references missing camera");
-    }
-    cameras_by_image.emplace(image.id, *camera_it);
-  }
   TwoViewGeometryBatchOptions geometry_options;
   geometry_options.keep_degenerate = true;
-  if (WorkspaceCacheIsValid(options_.workspace_path, "geometry",
-                            geometry_hash)) {
+  geometry_options.geometry_options = options_.two_view_geometry;
+  if (geometry_cache_valid) {
     ReadWorkspaceVerifiedGeometries(options_.workspace_path, &graph);
     const WorkspaceCacheMetadata metadata =
         ReadWorkspaceCacheMetadata(options_.workspace_path, "geometry");
@@ -333,28 +505,43 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
         read_guided_size("guided_improved_pairs");
     summary.geometry_cache_hit = true;
   } else {
-    VerifyMatchGraphGeometries(cameras_by_image, &graph, geometry_options);
-    if (options_.guided_matching) {
-      WeakPairRematchingOptions guided_options;
-      guided_options.nearby_image_window = 0;
-      guided_options.min_inlier_gain = options_.guided_min_inlier_gain;
-      guided_options.relaxed_matching = matching_options;
-      guided_options.relaxed_matching.max_ratio = options_.guided_match_ratio;
-      guided_options.relaxed_matching.mutual_check = true;
-      guided_options.guided_matching.max_sampson_error_px =
-          geometry_options.geometry_options.max_error_px;
-      guided_options.verification = geometry_options.geometry_options;
-      summary.guided_matching =
-          RematchWeakImagePairs(cameras_by_image, guided_options, &graph);
+    if (!summary.frontend_pipeline_used) {
+      const auto verify_start = Clock::now();
+      VerifyMatchGraphGeometries(cameras_by_image, &graph, geometry_options);
+      summary.geometry_verification_seconds = elapsed(verify_start);
+      if (options_.guided_matching) {
+        WeakPairRematchingOptions guided_options;
+        guided_options.nearby_image_window = 0;
+        guided_options.min_inlier_gain = options_.guided_min_inlier_gain;
+        guided_options.relaxed_matching = matching_options;
+        guided_options.relaxed_matching.max_ratio = options_.guided_match_ratio;
+        guided_options.relaxed_matching.mutual_check = matching_options.mutual_check;
+        guided_options.guided_matching.max_sampson_error_px =
+            geometry_options.geometry_options.max_error_px;
+        guided_options.verification = geometry_options.geometry_options;
+        const auto guided_start = Clock::now();
+        summary.guided_matching =
+            RematchWeakImagePairs(cameras_by_image, guided_options, &graph,
+                                 prepared_features.empty() ? nullptr : &prepared_features);
+        summary.guided_matching_seconds = elapsed(guided_start);
+      }
     }
+    prepared_features.clear();
+    ReleaseDescriptorMatcherWorkspace();
+    // Raw data has already been persisted. Consistency and geometry export
+    // only consume verified pairs; do not overlap their scratch with raw pairs.
+    graph.matches.clear();
+    ReleaseUnusedMemory();
+    const auto consistency_start = Clock::now();
     EnforceVerifiedMatchGraphConsistency(&graph);
+    summary.graph_consistency_seconds = elapsed(consistency_start);
+    const auto geometry_write_start = Clock::now();
     WriteWorkspaceVerifiedGeometries(options_.workspace_path, graph);
+    summary.workspace_write_seconds += elapsed(geometry_write_start);
 
     for (const auto& [pair, geometry] : graph.verified_geometries) {
       (void)pair;
-      if (geometry.type != TwoViewGeometry::Type::kUndefined &&
-          geometry.type != TwoViewGeometry::Type::kDegenerate &&
-          !geometry.inlier_matches.empty()) {
+      if (geometry.HasUsableCorrespondences()) {
         ++summary.num_verified_pairs;
         summary.num_verified_inliers += geometry.inlier_matches.size();
       }
@@ -369,13 +556,22 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
               summary.guided_matching.num_rematched_pairs)},
          {"guided_improved_pairs", std::to_string(
               summary.guided_matching.num_improved_pairs)}},
-        {"matches/verified_matches.tsv"});
+        {"matches/verified_matches.tsv", "features", "cameras.txt", "images.tsv"});
   }
 
   std::filesystem::create_directories(
       WorkspaceMatchesPath(options_.workspace_path));
   std::ofstream summary_file(WorkspaceMatchesPath(options_.workspace_path) /
                              "summary.txt");
+  summary_file << "frontend_pipeline_used " << summary.frontend_pipeline_used
+      << "\nfrontend_pipeline_seconds " << summary.frontend_pipeline_seconds << "\n";
+  summary_file << "feature_loading_seconds " << summary.feature_loading_seconds
+      << "\ndescriptor_preparation_seconds " << summary.descriptor_preparation_seconds
+      << "\ndescriptor_matching_seconds " << summary.descriptor_matching_seconds
+      << "\ngeometry_verification_seconds " << summary.geometry_verification_seconds
+      << "\nguided_matching_seconds " << summary.guided_matching_seconds
+      << "\ngraph_consistency_seconds " << summary.graph_consistency_seconds
+      << "\nworkspace_write_seconds " << summary.workspace_write_seconds << "\n";
   summary_file << "pairs " << summary.num_pairs << "\n"
                << "verified_pairs " << summary.num_verified_pairs << "\n"
                << "verified_inliers " << summary.num_verified_inliers
@@ -402,6 +598,13 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
 
   summary.success = true;
   summary.num_images = images.size();
+  // Neither the result summary nor the persisted checkpoints borrow these
+  // buffers. Return their pages before CUDA runtime/library shutdown can
+  // overlap its own cleanup allocations with the completed match graph.
+  prepared_features.clear();
+  ReleaseDescriptorMatcherWorkspace();
+  graph = MatchGraph{};
+  ReleaseUnusedMemory();
   LOG(INFO) << "Matching complete: pairs=" << summary.num_pairs
             << " verified_pairs=" << summary.num_verified_pairs
             << " verified_inliers=" << summary.num_verified_inliers

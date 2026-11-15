@@ -1,8 +1,11 @@
 ﻿#include "colite/exe/recon_sfm.h"
 
 #include <filesystem>
+#include <chrono>
+#include <cmath>
 #include <fstream>
 #include <sstream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -11,6 +14,7 @@
 
 #include "colite/controllers/recon_sfm_controller.h"
 #include "colite/core/camera.h"
+#include "colite/core/geometry.h"
 #include "colite/core/match_graph.h"
 #include "colite/core/pose.h"
 #include "colite/io/camera_prior.h"
@@ -57,28 +61,226 @@ TEST(ReconSfmExeTest, PrintsHelp) {
 
   EXPECT_EQ(exit_code, 0);
   EXPECT_NE(out.str().find("Usage:"), std::string::npos);
-  EXPECT_NE(out.str().find("--feature_extractor"), std::string::npos);
-  EXPECT_NE(out.str().find("--feature_num_threads"), std::string::npos);
-  EXPECT_NE(out.str().find("--camera_mode"), std::string::npos);
-  EXPECT_NE(out.str().find("--camera_model"), std::string::npos);
-  EXPECT_NE(out.str().find("--camera_params"), std::string::npos);
-  EXPECT_NE(out.str().find("--default_focal_length_factor"),
+  EXPECT_NE(out.str().find("--Colite.feature_extractor"), std::string::npos);
+  EXPECT_NE(out.str().find("--FeatureExtraction.type"), std::string::npos);
+  EXPECT_NE(out.str().find("--FeatureExtraction.max_image_size"), std::string::npos);
+  EXPECT_NE(out.str().find("--Colite.learned_cuda_memory_limit_mb"),
             std::string::npos);
-  EXPECT_NE(out.str().find("--ba_refine_focal_length"), std::string::npos);
-  EXPECT_NE(out.str().find("--ba_refine_principal_point"), std::string::npos);
-  EXPECT_NE(out.str().find("--ba_refine_extra_params"), std::string::npos);
-  EXPECT_NE(out.str().find("--ba_refine_params"), std::string::npos);
-  EXPECT_NE(out.str().find("--max_registration_trials_per_image"),
+  EXPECT_NE(out.str().find("--Colite.hierarchical_num_workers"), std::string::npos);
+  EXPECT_NE(out.str().find("ALIKED_LIGHTGLUE"), std::string::npos);
+  EXPECT_NE(out.str().find("--FeatureMatching.use_gpu"), std::string::npos);
+  EXPECT_NE(out.str().find("--FeatureMatching.gpu_index"), std::string::npos);
+  EXPECT_NE(out.str().find("--Colite.mapper"), std::string::npos);
+  EXPECT_NE(out.str().find("hierarchical"), std::string::npos);
+  EXPECT_NE(out.str().find("--FeatureExtraction.num_threads"), std::string::npos);
+  EXPECT_NE(out.str().find("--ImageReader.single_camera"), std::string::npos);
+  EXPECT_NE(out.str().find("--ImageReader.camera_model"), std::string::npos);
+  EXPECT_NE(out.str().find("--ImageReader.camera_params"), std::string::npos);
+  EXPECT_NE(out.str().find("--ImageReader.default_focal_length_factor"),
             std::string::npos);
-  EXPECT_NE(out.str().find("--max_initialization_trials"), std::string::npos);
-  EXPECT_NE(out.str().find("--registration_retry_error_multiplier"),
+  EXPECT_NE(out.str().find("--Mapper.ba_refine_focal_length"), std::string::npos);
+  EXPECT_NE(out.str().find("--Mapper.ba_refine_principal_point"), std::string::npos);
+  EXPECT_NE(out.str().find("--Mapper.ba_refine_extra_params"), std::string::npos);
+  EXPECT_EQ(out.str().find("--ba_refine_params"), std::string::npos);
+  EXPECT_NE(out.str().find("--Mapper.max_reg_trials"),
             std::string::npos);
-  EXPECT_NE(out.str().find("--registration_retry_max_error"),
+  EXPECT_NE(out.str().find("--Mapper.init_num_trials"), std::string::npos);
+  EXPECT_NE(out.str().find("--Colite.registration_retry_error_multiplier"),
+            std::string::npos);
+  EXPECT_NE(out.str().find("--Colite.registration_retry_max_error"),
             std::string::npos);
   EXPECT_NE(out.str().find("cuda_opencv"), std::string::npos);
   EXPECT_NE(out.str().find("cuda_vlfeat"), std::string::npos);
   EXPECT_TRUE(err.str().empty());
 }
+
+TEST(ReconSfmExeTest, MapperThreadsAreValidatedAcrossPipelineKinds) {
+  for (const auto* mapper : {"incremental", "global", "hierarchical"}) {
+    const std::vector<std::string> base{"recon_sfm", "--image_path", "images",
+        "--output_path", "workspace", "--Colite.mapper", mapper, "--Mapper.num_threads"};
+    for (const auto* count : {"-1", "0", "4"}) {
+      auto args = base;
+      args.push_back(count);
+      EXPECT_NO_THROW(exe::ValidateReconSfmArguments(args));
+    }
+    auto args = base;
+    args.push_back("-2");
+    EXPECT_THROW(exe::ValidateReconSfmArguments(args), std::invalid_argument);
+  }
+}
+
+TEST(ReconSfmExeTest, CacheInvalidationFollowsStageDependencies) {
+  controllers::ReconSfmControllerOptions options;
+  const auto baseline = controllers::BuildReconSfmCacheIdentity(options, {});
+  options.mapper_options["--Mapper.num_threads"] = "4";
+  const auto threads = controllers::BuildReconSfmCacheIdentity(options, {});
+  EXPECT_EQ(threads.features, baseline.features);
+  EXPECT_EQ(threads.matching, baseline.matching);
+  EXPECT_EQ(threads.frontend, baseline.frontend);
+  EXPECT_NE(threads.sparse, baseline.sparse);
+  options = {};
+  options.aliked_max_image_size = 800;
+  const auto resized = controllers::BuildReconSfmCacheIdentity(options, {});
+  EXPECT_NE(resized.features, baseline.features);
+  EXPECT_NE(resized.matching, baseline.matching);
+  EXPECT_NE(resized.frontend, baseline.frontend);
+  EXPECT_NE(resized.sparse, baseline.sparse);
+
+  options = {};
+  options.ba_refine_camera_param_names = {"f"};
+  const auto refined = controllers::BuildReconSfmCacheIdentity(options, {});
+  EXPECT_EQ(refined.features, baseline.features);
+  EXPECT_EQ(refined.frontend, baseline.frontend);
+  EXPECT_NE(refined.sparse, baseline.sparse);
+
+  options = {};
+  options.registration_retry_reprojection_error_multiplier = 2.0;
+  const auto retry = controllers::BuildReconSfmCacheIdentity(options, {});
+  EXPECT_EQ(retry.frontend, baseline.frontend);
+  EXPECT_NE(retry.sparse, baseline.sparse);
+  options = {};
+  options.registration_retry_max_reprojection_error_px = 6.0;
+  EXPECT_NE(controllers::BuildReconSfmCacheIdentity(options, {}).sparse, baseline.sparse);
+
+  options = {};
+  options.guided_match_ratio += 1e-8;
+  const auto fine_tuning = controllers::BuildReconSfmCacheIdentity(options, {});
+  EXPECT_EQ(fine_tuning.features, baseline.features);
+  EXPECT_EQ(fine_tuning.matching, baseline.matching);
+  EXPECT_NE(fine_tuning.frontend, baseline.frontend);
+  EXPECT_NE(fine_tuning.sparse, baseline.sparse);
+
+  options = {};
+  options.resume = true;
+  options.output_path = "another_output";
+  options.feature_num_threads = 2;
+  EXPECT_EQ(controllers::BuildReconSfmCacheIdentity(options, {}).sparse, baseline.sparse);
+  options = {};
+  options.two_view_geometry.max_error_px += 1e-8;
+  const auto geometry = controllers::BuildReconSfmCacheIdentity(options, {});
+  EXPECT_EQ(geometry.features, baseline.features);
+  EXPECT_EQ(geometry.matching, baseline.matching);
+  EXPECT_NE(geometry.frontend, baseline.frontend);
+  EXPECT_NE(geometry.sparse, baseline.sparse);
+  options = {};
+  options.max_distance += 1e-8;
+  EXPECT_NE(controllers::BuildReconSfmCacheIdentity(options, {}).matching, baseline.matching);
+  EXPECT_NE(controllers::BuildReconSfmCacheIdentity(options, {}).frontend, baseline.frontend);
+  options = {};
+  options.guided_matching = true;
+  EXPECT_EQ(controllers::BuildReconSfmCacheIdentity(options, {}).matching, baseline.matching);
+  EXPECT_NE(controllers::BuildReconSfmCacheIdentity(options, {}).frontend, baseline.frontend);
+  options = {};
+  options.mapper_options["--Mapper.tri_min_angle"] = "2.0";
+  const auto triangulation = controllers::BuildReconSfmCacheIdentity(options, {});
+  EXPECT_EQ(triangulation.frontend, baseline.frontend);
+  EXPECT_NE(triangulation.sparse, baseline.sparse);
+}
+
+class ReconSfmRawCacheTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(ReconSfmRawCacheTest, SeparatesRawGeometryAndRepairsDamagedCheckpoints) {
+  const bool cuda = GetParam();
+  if (cuda && !IsCudaDescriptorMatcherAvailable()) GTEST_SKIP() << "CUDA matcher unavailable";
+  const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto root = std::filesystem::temp_directory_path() /
+      ("colite_raw_cache_" + std::to_string(stamp));
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() { std::filesystem::remove_all(path); }
+  } cleanup{root};
+  std::filesystem::create_directories(root / "images");
+  controllers::ReconSfmControllerOptions options;
+  options.image_path = root / "images";
+  options.output_path = root / "output";
+  options.resume = true;
+  options.feature_execution.use_gpu = false;
+  options.matching_execution.use_gpu = cuda;
+  options.matching_execution.num_threads = 2;
+  options.camera_sharing_mode = controllers::CameraSharingMode::kSingle;
+  options.camera_model_id = CameraModelId::kPinhole;
+  options.camera_params = {700, 700, 500, 400};
+  options.guided_matching = true;
+  options.two_view_geometry.random_seed = 0;
+  options.mapper_options = {{"--Mapper.random_seed", "0"}, {"--Mapper.num_threads", "2"},
+      {"--Mapper.init_min_num_inliers", "30"}, {"--Mapper.init_min_tri_angle", "5"}};
+  options = controllers::ReconSfmController(options).Options();
+  std::vector<std::filesystem::path> images;
+  for (int id = 1; id <= 3; ++id) {
+    images.push_back(options.image_path / (std::to_string(id) + ".png"));
+    ASSERT_TRUE(cv::imwrite(images.back().string(), cv::Mat(800, 1000, CV_8UC3, cv::Scalar(128, 128, 128))));
+  }
+  controllers::SfmCameraSetupOptions camera_options;
+  camera_options.sharing_mode = options.camera_sharing_mode;
+  camera_options.model_id = options.camera_model_id;
+  camera_options.camera_params = options.camera_params;
+  camera_options.image_root = options.image_path;
+  const auto setup = controllers::BuildSfmCameraSetup(images, camera_options);
+  const auto work = options.output_path / "workspace";
+  WriteWorkspaceCameras(work, setup.cameras);
+  WriteWorkspaceImages(work, setup.images);
+  // Seed only the feature checkpoint, so both matcher paths and every later
+  // cache transition execute real matching, verification, and reconstruction.
+  DescriptorMatrix descriptors(80, 128);
+  std::mt19937 rng(37);
+  for (int row = 0; row < descriptors.rows(); ++row) {
+    for (int col = 0; col < descriptors.cols(); ++col) descriptors(row, col) = 1 + rng() % 1000;
+    descriptors.row(row).normalize();
+  }
+  for (ImageId id = 1; id <= 3; ++id) {
+    FeatureSet features;
+    features.descriptors = descriptors;
+    Pose3 pose;
+    pose.t_cw = {-double(id - 1), 0, 0};
+    for (int i = 0; i < 80; ++i) {
+      const Eigen::Vector3d point(.6 * std::sin(1.7 * i), .7 * std::cos(2.3 * i), 4 + .05 * i);
+      const auto xy = ProjectWorldPoint(setup.cameras.front(), pose, point);
+      ASSERT_TRUE(xy);
+      features.keypoints.push_back({float(xy->x()), float(xy->y()), 1, 0});
+    }
+    WriteWorkspaceFeatureSet(work, id, features);
+  }
+  const auto identity = controllers::BuildReconSfmCacheIdentity(options, images);
+  WriteWorkspaceCacheMetadata(work, "features", identity.features,
+      {{"images", "3"}, {"features", "240"}}, {"features", "cameras.txt", "images.tsv"});
+  auto run = [&]() {
+    std::ostringstream out;
+    EXPECT_EQ(controllers::ReconSfmController(options).Run(out), 0) << out.str();
+    EXPECT_NE(out.str().find("Registered images: 3"), std::string::npos) << out.str();
+    return out.str();
+  };
+  auto flags = [](const std::string& log, bool raw, bool geometry) {
+    EXPECT_NE(log.find("Raw match cache hit: " + std::to_string(raw)), std::string::npos) << log;
+    EXPECT_NE(log.find("Geometry cache hit: " + std::to_string(geometry)), std::string::npos) << log;
+  };
+  flags(run(), false, false);
+  const auto raw_file = work / "matches/raw_matches.tsv";
+  const auto raw = ReadTextFile(raw_file);
+  const auto raw_time = std::filesystem::last_write_time(raw_file);
+  const auto verified = ReadTextFile(work / "matches/verified_matches.tsv");
+  const auto diagnostics = ReadTextFile(options.output_path / "pair_diagnostics.tsv");
+  EXPECT_NE(run().find("SfM cache hit: 1"), std::string::npos);
+  std::filesystem::remove(work / "cache/recon_sfm.txt");
+  flags(run(), true, true);
+  EXPECT_EQ(ReadTextFile(options.output_path / "pair_diagnostics.tsv"), diagnostics);
+  std::filesystem::remove(work / "matches/verified_matches.tsv");
+  flags(run(), true, false);
+  EXPECT_EQ(ReadTextFile(work / "matches/verified_matches.tsv"), verified);
+  options.two_view_geometry.max_error_px = 3.5;
+  flags(run(), true, false);
+  EXPECT_EQ(ReadTextFile(raw_file), raw);
+  EXPECT_EQ(std::filesystem::last_write_time(raw_file), raw_time);
+  options.max_ratio = .7;
+  flags(run(), false, false);
+  { std::ofstream truncated(raw_file); truncated << "# incomplete\n"; }
+  flags(run(), false, false);
+  EXPECT_EQ(ReadTextFile(raw_file), raw);
+  std::filesystem::remove(raw_file);
+  flags(run(), false, false);
+  EXPECT_EQ(ReadTextFile(raw_file), raw);
+}
+
+INSTANTIATE_TEST_SUITE_P(Backends, ReconSfmRawCacheTest, ::testing::Values(false, true));
 
 TEST(ReconSfmExeTest, PrintsHelpThroughExeLayer) {
   std::ostringstream out;
@@ -123,12 +325,68 @@ TEST(ReconSfmExeTest, RejectsInvalidRegistrationTrialLimit) {
 
   const int exit_code = exe::RunReconSfm(
       {"recon_sfm", "--image_path", "images", "--output_path", "out",
-       "--max_registration_trials_per_image", "0"},
+       "--Mapper.max_reg_trials", "0"},
       out, err);
 
   EXPECT_NE(exit_code, 0);
-  EXPECT_NE(err.str().find("--max_registration_trials_per_image"),
+  EXPECT_NE(err.str().find("--Mapper.max_reg_trials"),
             std::string::npos);
+}
+
+TEST(ReconSfmExeTest, RejectsIncompatibleLearnedFrontendTypes) {
+  std::ostringstream out;
+  std::ostringstream err;
+  const int exit_code = exe::RunReconSfm(
+      {"recon_sfm", "--image_path", "images", "--output_path", "out",
+       "--FeatureExtraction.type", "aliked_n16rot", "--AlikedExtraction.n16rot_model_path", "a.onnx",
+       "--FeatureMatching.type", "SIFT_LIGHTGLUE", "--SiftMatching.lightglue_model_path",
+       "lightglue.onnx"},
+      out, err);
+  EXPECT_NE(exit_code, 0);
+  EXPECT_NE(err.str().find("incompatible"), std::string::npos);
+}
+
+TEST(ReconSfmExeTest, RejectsInvalidLearnedDeviceOptions) {
+  std::ostringstream out;
+  std::ostringstream err;
+  int exit_code = exe::RunReconSfm(
+      {"recon_sfm", "--image_path", "images", "--output_path", "out",
+       "--FeatureMatching.use_gpu", "tensor_core"},
+      out, err);
+  EXPECT_NE(exit_code, 0);
+  EXPECT_NE(err.str().find("Expected 0/1"), std::string::npos);
+
+  out.str("");
+  err.str("");
+  exit_code = exe::RunReconSfm(
+      {"recon_sfm", "--image_path", "images", "--output_path", "out",
+       "--FeatureMatching.gpu_index", "-2"},
+      out, err);
+  EXPECT_NE(exit_code, 0);
+  EXPECT_NE(err.str().find("--FeatureMatching.gpu_index"), std::string::npos);
+}
+
+TEST(ReconSfmExeTest, RejectsUnknownMapperType) {
+  std::ostringstream out;
+  std::ostringstream err;
+  const int exit_code = exe::RunReconSfm(
+      {"recon_sfm", "--image_path", "images", "--output_path", "out",
+       "--Colite.mapper", "unknown"},
+      out, err);
+  EXPECT_NE(exit_code, 0);
+  EXPECT_NE(err.str().find("Unsupported mapper"), std::string::npos);
+}
+
+TEST(ReconSfmExeTest, RejectsInvalidHierarchicalClusterLimits) {
+  std::ostringstream out;
+  std::ostringstream err;
+  const int exit_code = exe::RunReconSfm(
+      {"recon_sfm", "--image_path", "images", "--output_path", "out",
+       "--Colite.mapper", "hierarchical", "--Colite.hierarchical_target_cluster_size",
+       "10", "--Colite.hierarchical_max_cluster_size", "5"},
+      out, err);
+  EXPECT_NE(exit_code, 0);
+  EXPECT_NE(err.str().find("cluster size"), std::string::npos);
 }
 
 TEST(ReconSfmExeTest, RejectsInvalidRegistrationRetryOptions) {
@@ -137,11 +395,11 @@ TEST(ReconSfmExeTest, RejectsInvalidRegistrationRetryOptions) {
 
   const int exit_code = exe::RunReconSfm(
       {"recon_sfm", "--image_path", "images", "--output_path", "out",
-       "--registration_retry_error_multiplier", "0.5"},
+       "--Colite.registration_retry_error_multiplier", "0.5"},
       out, err);
 
   EXPECT_NE(exit_code, 0);
-  EXPECT_NE(err.str().find("--registration_retry_error_multiplier"),
+  EXPECT_NE(err.str().find("--Colite.registration_retry_error_multiplier"),
             std::string::npos);
 }
 
@@ -262,6 +520,16 @@ TEST(ReconSfmExeTest, WritesQualitySummaryAndPlyPointCloud) {
   summary.success = true;
   summary.num_registered_images = 2;
   summary.num_points3d = 1;
+  summary.num_global_refinements = 2;
+  summary.global_bundle_adjustment.initial_cost = 100;
+  summary.global_bundle_adjustment.final_cost = 10;
+  summary.global_bundle_adjustment.initial_mean_reprojection_error = 4;
+  summary.global_bundle_adjustment.final_mean_reprojection_error = 2;
+  summary.final_global_bundle_adjustment.initial_cost = 20;
+  summary.final_global_bundle_adjustment.final_cost = 5;
+  summary.final_global_bundle_adjustment.initial_mean_reprojection_error = 1;
+  summary.final_global_bundle_adjustment.final_mean_reprojection_error = 0.5;
+
 
   const std::filesystem::path output_path =
       std::filesystem::temp_directory_path() / "colite_summary_ply_test";
@@ -288,6 +556,10 @@ TEST(ReconSfmExeTest, WritesQualitySummaryAndPlyPointCloud) {
   EXPECT_NE(summary_text.find("cpu_threads 8"), std::string::npos);
   EXPECT_NE(summary_text.find("matching_seconds 2.5"), std::string::npos);
   EXPECT_NE(summary_text.find("mean_reprojection_error 0"), std::string::npos);
+  EXPECT_NE(summary_text.find("global_ba_first_final_cost 10\n"), std::string::npos);
+  EXPECT_NE(summary_text.find("global_ba_last_final_cost 5\n"), std::string::npos);
+  EXPECT_NE(summary_text.find("global_ba_last_initial_mean_error 1\n"), std::string::npos);
+  EXPECT_NE(summary_text.find("global_ba_last_final_mean_error 0.5\n"), std::string::npos);
   EXPECT_NE(summary_text.find("max_reprojection_error 0"), std::string::npos);
   EXPECT_NE(ply_text.find("ply"), std::string::npos);
   EXPECT_NE(ply_text.find("element vertex 1"), std::string::npos);
@@ -413,6 +685,8 @@ TEST(ReconSfmExeTest, WritesRegistrationDiagnosticsForMappingRounds) {
   registration.local_retriangulation.num_merged_points = 1;
   registration.local_retriangulation.num_merged_observations = 2;
   registration.local_retriangulation.num_filtered_points = 2;
+  registration.num_local_refinements = 2;
+  registration.last_local_refinement_change = 0.125;
   registration.local_bundle_adjustment.local_image_ids = {7, 8, 9};
   registration.local_bundle_adjustment.fixed_image_ids = {3, 4};
   registration.local_bundle_adjustment.num_local_images = 3;
@@ -457,7 +731,7 @@ TEST(ReconSfmExeTest, WritesRegistrationDiagnosticsForMappingRounds) {
             std::string::npos);
   EXPECT_NE(diagnostics.find(
                 "2\t7\t128\t256\t2\t4\t512\t128500\t1\t3.5\t140\t118\t120\t11\t2"
-                "\t3\t23\t46\t5\t10\t1\t2\t2\t3\t2\t2\t6\t1\t0\t80\t260"
+                "\t3\t23\t46\t5\t10\t1\t2\t2\t2\t0.125\t3\t2\t2\t6\t1\t0\t80\t260"
                 "\t1.25\t0.75\t3\t1"),
             std::string::npos);
 

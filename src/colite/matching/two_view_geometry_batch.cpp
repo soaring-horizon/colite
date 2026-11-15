@@ -4,14 +4,13 @@
 #include <vector>
 
 #include "colite/core/parallel.h"
+#include "colite/core/progress.h"
 
 namespace colite {
 namespace {
 
 bool IsVerifiedGeometryUsable(const TwoViewGeometry& geometry) {
-  return geometry.type != TwoViewGeometry::Type::kUndefined &&
-         geometry.type != TwoViewGeometry::Type::kDegenerate &&
-         !geometry.inlier_matches.empty();
+  return geometry.HasUsableCorrespondences();
 }
 
 const Camera& RequireCamera(const std::map<ImageId, Camera>& cameras_by_image,
@@ -48,6 +47,7 @@ TwoViewGeometryBatchSummary VerifyMatchGraphGeometries(
     match_entries.push_back(&entry);
   }
   std::vector<TwoViewGeometry> geometries(match_entries.size());
+  ProgressCounter progress("geometry_verification", match_entries.size());
 
   parallel::parallel_for_(
       parallel::Range(0, static_cast<int>(match_entries.size())),
@@ -65,6 +65,7 @@ TwoViewGeometryBatchSummary VerifyMatchGraphGeometries(
           geometries[index] = EstimateTwoViewGeometry(
               camera1, features1, camera2, features2, matches,
               options.geometry_options);
+          progress.Advance();
         }
       });
 

@@ -1,7 +1,10 @@
 #include "colite/mvs/patch_match.h"
 #include "colite/mvs/patch_match_cuda.h"
+#include "colite/mvs/patch_match_likelihood.h"
 
+#include <algorithm>
 #include <cmath>
+#include <atomic>
 #include <filesystem>
 
 #include <gtest/gtest.h>
@@ -293,6 +296,18 @@ TEST(CpuPatchMatchPhotometricCostTest, PenalizesInvertedPatches) {
   EXPECT_GT(cost.cost, 0.99F);
 }
 
+TEST(CpuPatchMatchPhotometricCostTest, RejectsLowVarianceMatchingNoise) {
+  MvsImage image = MakeGradientImage(5, 5);
+  image.gray = image.gray * 0.05F + 0.5F;
+  PatchMatchCostOptions options;
+  options.window_radius = 1;
+  EXPECT_FALSE(ComputePatchZncc(image, image, {2.0F, 2.0F}, {2.0F, 2.0F},
+                               options).valid);
+  options.min_variance = 1e-8F;
+  EXPECT_TRUE(ComputePatchZncc(image, image, {2.0F, 2.0F}, {2.0F, 2.0F},
+                              options).valid);
+}
+
 TEST(CpuPatchMatchPhotometricCostTest,
      BilateralWeightsSuppressCrossEdgePhotometricOutliers) {
   MvsImage reference = MakeGradientImage(5, 5);
@@ -424,6 +439,226 @@ TEST(CpuPatchMatchPhotometricCostTest,
   ASSERT_TRUE(cost_without_source_depth.valid);
   ASSERT_TRUE(cost_with_source_depth.valid);
   EXPECT_GT(cost_with_source_depth.cost, cost_without_source_depth.cost);
+}
+
+TEST(PatchMatchGeometricSamplingTest, UsesNearestDepthAcrossDiscontinuities) {
+  const PatchMatchView ref_view = MakeView(1);
+  const std::vector<PatchMatchView> src_views{MakeView(2, 0.18)};
+  const MvsImage image = MakeGradientImage(5, 5);
+  const std::vector<MvsImage> src_images{image};
+  std::vector<DenseDepthMap> src_depths{DenseDepthMap(5, 5, 1.0F, 5.0F)};
+  for (std::size_t row : {2U, 3U}) {
+    src_depths[0].Set(row, 2, 2.85F);
+    src_depths[0].Set(row, 3, 3.10F);
+  }
+  PatchMatchMaps initial;
+  initial.depth_map = DenseDepthMap(5, 5, 2.0F, 4.0F);
+  initial.depth_map.Fill(3.0F);
+  initial.normal_map = NormalMap(5, 5);
+  initial.normal_map.Fill(Eigen::Vector3f(0.0F, 0.0F, -1.0F));
+  PatchMatchStereoOptions options;
+  options.num_iterations = 0;
+  options.cost.window_radius = 1;
+  options.cost.geometric_reject_occluded_candidates = false;
+  options.cost.geometric_reject_depth_conflicts = false;
+  const auto cpu_cost = [&](const PatchMatchCostOptions& cost_options) {
+    return ComputePlaneHypothesisCost(
+        ref_view, src_views[0], image, image, {2.0F, 2.0F}, 3.0F,
+        initial.normal_map.Get(2, 2), cost_options, &src_depths[0]);
+  };
+  const auto photo = cpu_cost(options.cost);
+  ASSERT_TRUE(photo.valid);
+  options.cost.geometric_consistency_weight = 1.0F;
+  const auto geometric = cpu_cost(options.cost);
+  ASSERT_TRUE(geometric.valid);
+  // Projection is (2.6, 2): bilinear depth is exactly 3, but COLMAP's
+  // nearest depth is 3.1 and must produce a nonzero round-trip penalty.
+  const float reprojection = 1.8F * std::abs(1.0F / 3.1F - 1.0F / 3.0F);
+  EXPECT_NEAR(geometric.cost - photo.cost, 0.5F * reprojection, 1e-5F);
+  PatchMatchGeometricConsistencyOptions graph_options;
+  graph_options.max_relative_depth_error = 0.0F;
+  graph_options.max_reprojection_error_pixels = 0.005F;
+  EXPECT_EQ(ComputeGeometricConsistencyGraph(
+                ref_view, src_views, initial.depth_map, src_depths,
+                graph_options).Count(2, 2), 0U);
+  graph_options.max_reprojection_error_pixels = 0.03F;
+  EXPECT_EQ(ComputeGeometricConsistencyGraph(
+                ref_view, src_views, initial.depth_map, src_depths,
+                graph_options).Count(2, 2), 1U);
+  if (IsCudaPatchMatchCompiled()) {
+    ASSERT_TRUE(IsCudaPatchMatchAvailable())
+        << CudaPatchMatchUnavailableReason();
+    CudaPatchMatchRequest request;
+    request.reference_view = &ref_view;
+    request.source_views = &src_views;
+    request.reference_image = &image;
+    request.source_images = &src_images;
+    request.source_depth_maps = &src_depths;
+    request.initial_maps = &initial;
+    request.depth_min = 2.0F;
+    request.depth_max = 4.0F;
+    request.options = options;
+    std::string reason;
+    const auto result = RunCudaPatchMatchStereo(request, &reason);
+    ASSERT_TRUE(result.has_value()) << reason;
+    ASSERT_TRUE(result->cost_map.IsValid(2, 2));
+    EXPECT_NEAR(result->cost_map.Get(2, 2), geometric.cost, 2e-4F);
+  }
+  // A missing nearest depth cannot be filled from the other side of an edge.
+  src_depths[0].Set(2, 3, 0.0F);
+  const auto missing = cpu_cost(options.cost);
+  ASSERT_TRUE(missing.valid);
+  EXPECT_NEAR(missing.cost - photo.cost,
+              0.5F * options.cost.geometric_max_reprojection_error, 1e-5F);
+  EXPECT_EQ(ComputeGeometricConsistencyGraph(
+                ref_view, src_views, initial.depth_map, src_depths,
+                graph_options).Count(2, 2), 0U);
+}
+
+TEST(PatchMatchGeometricSamplingTest, IgnoresDepthBehindTheCandidateSurface) {
+  auto view = MakeView(1);
+  view.camera.width = view.camera.height = 33;
+  view.camera.params =
+      InitializeCameraParams(CameraModelId::kPinhole, 10, 33, 33);
+  auto image = MakeGradientImage(33, 33);
+  image.gray *= 0.05F;
+  std::vector<PatchMatchView> sources(3, view);
+  for (int i = 0; i < 3; ++i) sources[i].image_id = i + 2;
+  for (int i = 1; i < 3; ++i) {
+    sources[i].cam_from_world.q_cw =
+        Eigen::Quaterniond(Eigen::AngleAxisd(std::acos(-1.0),
+                                           Eigen::Vector3d::UnitY()));
+    const Eigen::Vector3d center(i == 1 ? 1 : -1, 0, 6);
+    sources[i].cam_from_world.t_cw =
+        -(sources[i].cam_from_world.q_cw * center);
+  }
+  std::vector<MvsImage> images(3, image);
+  std::vector<DenseDepthMap> depths(3, DenseDepthMap(33, 33, 0.5F, 8.0F));
+  for (auto& map : depths) map.Fill(3.0F);
+  PatchMatchMaps initial;
+  initial.depth_map = DenseDepthMap(33, 33, 2.0F, 4.0F);
+  initial.depth_map.Fill(3.0F);
+  initial.normal_map = NormalMap(33, 33);
+  initial.normal_map.Fill(Eigen::Vector3f(0, 0, -1));
+  PatchMatchStereoOptions options;
+  options.num_iterations = 0;
+  options.cost.window_radius = 1;
+  options.cost.max_num_aggregated_costs = 1;
+  options.cost.robust_geometric_aggregation = true;
+  options.cost.geometric_consistency_weight = 0.3F;
+  options.cost.geometric_reject_occluded_candidates = false;
+  options.cost.geometric_reject_depth_conflicts = false;
+  const auto cost = [&](const Eigen::Vector3f& normal) {
+    return ComputeMultiSourcePlaneHypothesisCost(
+        view, sources, image, images, {16, 16}, 3, normal, options.cost,
+        &depths);
+  };
+  ASSERT_TRUE(cost({0, 0, -1}).valid);
+  const float expected = cost({0, 0, -1}).cost;
+  depths[1].Fill(1.0F);
+  depths[2].Fill(1.0F);
+  EXPECT_NEAR(cost({0, 0, -1}).cost, expected, 1e-5F);
+  EXPECT_NEAR(cost({0, 0, 1}).cost, expected, 1e-5F);
+  depths[0].Fill(0.0F);
+  const float missing_cost = expected + 0.5F *
+      options.cost.geometric_consistency_weight *
+      options.cost.geometric_max_reprojection_error;
+  EXPECT_NEAR(cost({0, 0, -1}).cost, missing_cost, 1e-5F);
+  depths[0].Fill(3.0F);
+  if (IsCudaPatchMatchCompiled()) {
+    ASSERT_TRUE(IsCudaPatchMatchAvailable()) << CudaPatchMatchUnavailableReason();
+    CudaPatchMatchRequest request;
+    request.reference_view = &view;
+    request.source_views = &sources;
+    request.reference_image = &image;
+    request.source_images = &images;
+    request.source_depth_maps = &depths;
+    request.initial_maps = &initial;
+    request.depth_min = 2;
+    request.depth_max = 4;
+    request.options = options;
+    std::string reason;
+    const auto result = RunCudaPatchMatchStereo(request, &reason);
+    ASSERT_TRUE(result) << reason;
+    ASSERT_TRUE(result->cost_map.IsValid(16, 16));
+    EXPECT_NEAR(result->cost_map.Get(16, 16), expected, 2e-4F);
+    initial.normal_map.Fill(Eigen::Vector3f(0, 0, 1));
+    const auto flipped = RunCudaPatchMatchStereo(request, &reason);
+    ASSERT_TRUE(flipped) << reason;
+    EXPECT_NEAR(flipped->cost_map.Get(16, 16), expected, 2e-4F);
+    depths[0].Fill(0.0F);
+    const auto missing = RunCudaPatchMatchStereo(request, &reason);
+    ASSERT_TRUE(missing) << reason;
+    EXPECT_NEAR(missing->cost_map.Get(16, 16), missing_cost, 2e-4F);
+    depths[0].Fill(3.0F);
+    initial.normal_map.Fill(Eigen::Vector3f(0, 0, -1));
+    request.options.source_selection.num_samples = 64;
+    const auto sampled = RunCudaPatchMatchStereo(request, &reason);
+    ASSERT_TRUE(sampled) << reason;
+    depths[1].Fill(3.0F);
+    depths[2].Fill(3.0F);
+    const auto sampled_changed = RunCudaPatchMatchStereo(request, &reason);
+    ASSERT_TRUE(sampled_changed) << reason;
+    EXPECT_NEAR(sampled->cost_map.Get(16, 16),
+                sampled_changed->cost_map.Get(16, 16), 2e-4F);
+  }
+}
+
+TEST(PatchMatchGeometricSamplingTest, MissingDepthCannotBecomeConsensusSupport) {
+  auto view = MakeView(1);
+  view.camera.width = view.camera.height = 33;
+  view.camera.params =
+      InitializeCameraParams(CameraModelId::kPinhole, 10, 33, 33);
+  auto image = MakeGradientImage(33, 33);
+  image.gray *= 0.05F;
+  std::vector<PatchMatchView> sources(4, view);
+  for (int i = 0; i < 4; ++i) sources[i].image_id = i + 2;
+  std::vector<MvsImage> images(4, image);
+  std::vector<DenseDepthMap> depths(4, DenseDepthMap(33, 33, 1, 5));
+  PatchMatchMaps initial;
+  initial.depth_map = DenseDepthMap(33, 33, 2, 4);
+  initial.depth_map.Fill(3);
+  initial.normal_map = NormalMap(33, 33);
+  initial.normal_map.Fill(Eigen::Vector3f(0, 0, -1));
+  PatchMatchStereoOptions options;
+  options.num_iterations = 0;
+  options.cost.window_radius = 1;
+  options.cost.geometric_consistency_weight = 0.3F;
+  options.cost.geometric_reject_occluded_candidates = false;
+  options.cost.geometric_reject_depth_conflicts = false;
+
+  // One matching view cannot stand in for the required lower-half consensus.
+  // Two matching views tolerate the other half being absent; no evidence
+  // receives the full penalty. Photometric evidence is identical in all cases.
+  for (const int support : {1, 2, 0}) {
+    for (int i = 0; i < 4; ++i) depths[i].Fill(i < support ? 3.0F : 0.0F);
+    const float expected = support == 2 ? 0.0F : support == 1 ? 0.225F : 0.45F;
+    const auto cpu = ComputeMultiSourcePlaneHypothesisCost(
+        view, sources, image, images, {16, 16}, 3, {0, 0, -1},
+        options.cost, &depths);
+    ASSERT_TRUE(cpu.valid);
+    EXPECT_NEAR(cpu.cost, expected, 1e-5F) << "support=" << support;
+    if (!IsCudaPatchMatchCompiled()) continue;
+    ASSERT_TRUE(IsCudaPatchMatchAvailable()) << CudaPatchMatchUnavailableReason();
+    for (const std::size_t samples : {0U, 15U}) {
+      CudaPatchMatchRequest request;
+      request.reference_view = &view;
+      request.source_views = &sources;
+      request.reference_image = &image;
+      request.source_images = &images;
+      request.source_depth_maps = &depths;
+      request.initial_maps = &initial;
+      request.depth_min = 2;
+      request.depth_max = 4;
+      request.options = options;
+      request.options.source_selection.num_samples = samples;
+      std::string reason;
+      const auto result = RunCudaPatchMatchStereo(request, &reason);
+      ASSERT_TRUE(result) << reason;
+      EXPECT_NEAR(result->cost_map.Get(16, 16), expected, 2e-4F)
+          << "support=" << support << " samples=" << samples;
+    }
+  }
 }
 
 TEST(CpuPatchMatchPhotometricCostTest, AggregatesBestSourceViewCosts) {
@@ -1070,6 +1305,49 @@ TEST(PatchMatchBackendTest,
   EXPECT_NEAR(result->cost_map.Get(7, 7), cpu_cost.cost, 5e-4F);
 }
 
+TEST(PatchMatchBackendTest, CudaNccMatchesDoublePrecisionForBrightLowContrastTexture) {
+  if (!IsCudaPatchMatchCompiled()) GTEST_SKIP();
+  ASSERT_TRUE(IsCudaPatchMatchAvailable()) << CudaPatchMatchUnavailableReason();
+  for (bool bilateral : {false, true}) for (float offset : {0.05F, 0.9F}) for (bool corner : {false, true}) for (int step : {1, 2}) {
+    SCOPED_TRACE(::testing::Message() << "bilateral=" << bilateral << " offset=" << offset << " corner=" << corner << " step=" << step);
+    MvsImage reference = MakeGradientImage(31, 31), source = reference;
+    source.gray = reference.gray.clone();
+    for (int row = 0; row < 31; ++row) for (int col = 0; col < 31; ++col) {
+      const float pattern = ((row * 47 + col * 19 + row * col * 7) % 101) / 50.0F - 1.0F;
+      const float noise = ((row * 11 + col * 37) % 79) / 39.0F - 1.0F;
+      reference.gray.at<float>(row, col) = offset + 0.009F * pattern;
+      source.gray.at<float>(row, col) = offset + 0.00783F * pattern + 0.0011F * noise;
+    }
+    if (corner) {
+      reference.gray.at<float>(3, 3) = 0.1F;
+      source.gray.at<float>(3, 3) = 0.2F;
+    }
+    const auto ref_view = MakeView(1);
+    const std::vector<PatchMatchView> source_views{MakeView(2)};
+    const std::vector<MvsImage> source_images{source};
+    PatchMatchMaps initial;
+    initial.depth_map = DenseDepthMap(31, 31, 2, 6); initial.depth_map.Fill(3);
+    initial.normal_map = NormalMap(31, 31); initial.normal_map.Fill({0, 0, -1});
+    PatchMatchStereoOptions options;
+    options.backend = PatchMatchBackend::kCuda; options.num_iterations = 0;
+    options.cost.window_radius = 5; options.cost.window_step = step; options.cost.bilateral_weighting = bilateral;
+    CudaPatchMatchRequest request;
+    request.reference_view = &ref_view; request.source_views = &source_views;
+    request.reference_image = &reference; request.source_images = &source_images;
+    request.initial_maps = &initial; request.depth_min = 2; request.depth_max = 6; request.options = options;
+    std::string reason;
+    const auto actual = RunCudaPatchMatchStereo(request, &reason);
+    ASSERT_TRUE(actual) << reason;
+    for (const auto xy : {Eigen::Vector2f(8, 8), Eigen::Vector2f(16, 16), Eigen::Vector2f(22, 10)}) {
+      const auto expected = ComputePlaneHypothesisCost(ref_view, source_views[0], reference,
+          source, xy, 3, Eigen::Vector3f(0, 0, -1), options.cost);
+      ASSERT_TRUE(expected.valid);
+      ASSERT_TRUE(actual->cost_map.IsValid(static_cast<int>(xy.y()), static_cast<int>(xy.x())));
+      EXPECT_NEAR(actual->cost_map.Get(static_cast<int>(xy.y()), static_cast<int>(xy.x())), expected.cost, 2e-5F);
+    }
+  }
+}
+
 TEST(PatchMatchBackendTest,
      CudaBackendRandomInitialNormalsAreDeterministicAndDiverse) {
   if (!IsCudaPatchMatchCompiled()) {
@@ -1198,6 +1476,57 @@ TEST(PatchMatchBackendTest, CudaBackendPropagatesNeighborPlanesToCurrentRay) {
       RunCudaPatchMatchStereo(request, &unavailable_reason);
   ASSERT_TRUE(result.has_value()) << unavailable_reason;
   EXPECT_GT(result->summary.num_plane_propagation_candidates, 0U);
+}
+
+void CheckSelectionHistoryAnnealing(PatchMatchBackend backend,
+                                    std::size_t expected_updates) {
+  auto reference = MakeGradientImage(32, 32);
+  reference.gray *= 0.0625F;
+  auto ref_view = MakeView(1);
+  auto src_view = MakeView(2);
+  for (auto* view : {&ref_view, &src_view}) {
+    view->camera.width = view->camera.height = 32;
+    view->camera.params = InitializeCameraParams(CameraModelId::kPinhole, 10.0, 32, 32);
+  }
+  PatchMatchStereoOptions options;
+  options.backend = backend;
+  options.num_iterations = 2;
+  options.checkerboard_propagation_rounds = 2;
+  options.cost.window_radius = 1;
+  options.source_selection.dynamic_probability = true;
+  options.source_selection.directional_hmm = true;
+  options.source_selection.previous_probability_weight = 1.0F;
+  options.filter.enabled = true;
+  options.filter.min_ncc = 0.4F;
+  options.filter.min_num_consistent = 1;
+  options.filter.min_triangulation_angle_degrees = 0.0F;
+  const auto fixed = RunPatchMatchStereoForImage(
+      ref_view, {src_view}, reference, {reference}, 2.0F, 6.0F, options);
+  options.source_selection.anneal_history = true;
+  const auto annealed = RunPatchMatchStereoForImage(
+      ref_view, {src_view}, reference, {reference}, 2.0F, 6.0F, options);
+  ASSERT_EQ(annealed.summary.selection_history_weights.size(), expected_updates);
+  ASSERT_EQ(fixed.summary.selection_history_weights.size(), expected_updates);
+  EXPECT_FLOAT_EQ(annealed.summary.selection_history_weights.front(), 0.0F);
+  EXPECT_LT(annealed.summary.selection_history_weights.back(), 1.0F);
+  for (const auto weight : fixed.summary.selection_history_weights) {
+    EXPECT_FLOAT_EQ(weight, 1.0F);
+  }
+  // A frozen uniform prior cannot pass this filter. Annealing must let the
+  // identical images' actual evidence recover support, rather than only log
+  // a different weight without applying it to inference.
+  EXPECT_EQ(fixed.depth_map.ValidPixelCount(), 0U);
+  EXPECT_GT(annealed.depth_map.ValidPixelCount(), 0U);
+}
+
+TEST(CpuPatchMatchStereoTest, AnnealedHistoryRecoversFromFrozenUniformPrior) {
+  CheckSelectionHistoryAnnealing(PatchMatchBackend::kCpu, 2);
+}
+
+TEST(PatchMatchBackendTest, CudaAnnealedHistoryRecoversFromFrozenUniformPrior) {
+  if (!IsCudaPatchMatchCompiled()) GTEST_SKIP();
+  ASSERT_TRUE(IsCudaPatchMatchAvailable()) << CudaPatchMatchUnavailableReason();
+  CheckSelectionHistoryAnnealing(PatchMatchBackend::kCuda, 4);
 }
 
 TEST(PatchMatchBackendTest, CudaBackendEvaluatesDecoupledPerturbationCandidates) {
@@ -1775,6 +2104,7 @@ TEST(PatchMatchBackendTest,
   options.source_selection.dynamic_probability = true;
   options.source_selection.directional_hmm = true;
   options.source_selection.previous_probability_weight = 0.0F;
+  options.checkerboard_propagation_rounds = 2;
   options.perturbation.num_samples_per_pixel = 1;
 
   CudaPatchMatchRequest request;
@@ -1799,6 +2129,8 @@ TEST(PatchMatchBackendTest,
   ASSERT_EQ(repeated->summary.final_source_selection_probability_means.size(),
             2U);
   EXPECT_GT(result->summary.num_source_selection_probability_updates, 0U);
+  EXPECT_EQ(result->summary.num_source_selection_probability_updates,
+            reference.Width() * reference.Height() * source_views.size() * 2);
   EXPECT_GT(result->summary.final_source_selection_probability_means[0],
             result->summary.final_source_selection_probability_means[1]);
   EXPECT_NEAR(result->summary.final_source_selection_probability_means[0],
@@ -1807,6 +2139,132 @@ TEST(PatchMatchBackendTest,
   EXPECT_NEAR(result->summary.final_source_selection_probability_means[1],
               repeated->summary.final_source_selection_probability_means[1],
               1e-6F);
+}
+
+TEST(PatchMatchBackendTest, CudaBackendRefreshesCostAfterSourceProbabilityUpdate) {
+  if (!IsCudaPatchMatchCompiled()) {
+    GTEST_SKIP() << "CUDA PatchMatch backend is not compiled in this build.";
+  }
+  ASSERT_TRUE(IsCudaPatchMatchAvailable())
+      << CudaPatchMatchUnavailableReason();
+
+  const MvsImage reference = MakeGradientImage(8, 8);
+  MvsImage inconsistent = reference;
+  inconsistent.gray = reference.gray.clone();
+  for (int row = 0; row < 8; ++row) {
+    for (int col = 0; col < 8; ++col) {
+      inconsistent.gray.at<float>(row, col) =
+          (row + col) % 2 == 0 ? 0.0F : 1.0F;
+    }
+  }
+  const PatchMatchView view = MakeView(1);
+  const std::vector<PatchMatchView> sources{MakeView(2), MakeView(3)};
+  const std::vector<MvsImage> images{reference, inconsistent};
+  std::vector<DenseCostMap> priors(2, DenseCostMap(8, 8));
+  for (auto& prior : priors) prior.Fill(0.051F);
+
+  CudaPatchMatchRequest request;
+  request.reference_view = &view;
+  request.source_views = &sources;
+  request.reference_image = &reference;
+  request.source_images = &images;
+  request.source_selection_probability_maps = &priors;
+  request.depth_min = 2.0F;
+  request.depth_max = 6.0F;
+  auto& options = request.options;
+  options.backend = PatchMatchBackend::kCuda;
+  options.num_iterations = 1;
+  options.cost.window_radius = 1;
+  options.cost.max_num_aggregated_costs = 0;
+  options.source_selection.dynamic_probability = true;
+  options.source_selection.previous_probability_weight = 1.0F;
+
+  std::string reason;
+  const auto unchanged_prior = RunCudaPatchMatchStereo(request, &reason);
+  ASSERT_TRUE(unchanged_prior.has_value()) << reason;
+  EXPECT_GT(unchanged_prior->cost_map.Get(3, 3), 0.1F);
+
+  options.source_selection.previous_probability_weight = 0.0F;
+  const auto result = RunCudaPatchMatchStereo(request, &reason);
+  ASSERT_TRUE(result.has_value()) << reason;
+  // The inconsistent source drops to the probability floor. Identical poses
+  // make the remaining exact-match cost independent of the plane hypothesis.
+  // A stale pre-update cost would still average in the inconsistent source.
+  EXPECT_NEAR(result->cost_map.Get(3, 3), 0.0F, 1e-4F);
+}
+
+TEST(PatchMatchBackendTest, CudaSamplingPenalizesInvalidSourceWithoutRenormalizing) {
+  if (!IsCudaPatchMatchCompiled()) {
+    GTEST_SKIP() << "CUDA PatchMatch backend is not compiled in this build.";
+  }
+  ASSERT_TRUE(IsCudaPatchMatchAvailable())
+      << CudaPatchMatchUnavailableReason();
+  const MvsImage image = MakeGradientImage(8, 8);
+  const auto reference = MakeView(1);
+  std::vector<PatchMatchView> sources;
+  std::vector<MvsImage> images;
+  for (ImageId index = 0; index < 32; ++index) {
+    sources.push_back(MakeView(index + 2, index % 2 ? 1000.0 : 0.0));
+    images.push_back(image);
+  }
+  PatchMatchMaps initial;
+  initial.depth_map = DenseDepthMap(8, 8, 2.0F, 6.0F);
+  initial.depth_map.Fill(3.0F);
+  initial.normal_map = NormalMap(8, 8);
+  initial.normal_map.Fill(Eigen::Vector3f(0.0F, 0.0F, -1.0F));
+  CudaPatchMatchRequest request;
+  request.reference_view = &reference;
+  request.source_views = &sources;
+  request.reference_image = &image;
+  request.source_images = &images;
+  request.initial_maps = &initial;
+  request.depth_min = 2.0F;
+  request.depth_max = 6.0F;
+  request.options.backend = PatchMatchBackend::kCuda;
+  request.options.num_iterations = 2;
+  request.options.cost.window_radius = 1;
+  request.options.source_selection.num_samples = 64;
+  std::string reason;
+  const auto result = RunCudaPatchMatchStereo(request, &reason);
+  ASSERT_TRUE(result.has_value()) << reason;
+  // Exercise the 32-source boundary: half match exactly, half project outside.
+  // Removing failed samples and renormalizing would report a perfect zero cost.
+  EXPECT_GT(result->cost_map.Get(3, 3), 0.1F);
+  EXPECT_LT(result->cost_map.Get(3, 3), 0.9F);
+  const auto repeated = RunCudaPatchMatchStereo(request, &reason);
+  ASSERT_TRUE(repeated.has_value()) << reason;
+  EXPECT_FLOAT_EQ(result->cost_map.Get(3, 3), repeated->cost_map.Get(3, 3));
+  std::vector<DenseCostMap> weak_priors(sources.size(), DenseCostMap(8, 8));
+  for (auto& prior : weak_priors) prior.Fill(1e-12F);
+  request.source_selection_probability_maps = &weak_priors;
+  const auto weak = RunCudaPatchMatchStereo(request, &reason);
+  ASSERT_TRUE(weak.has_value()) << reason;
+  // Uniformly scaling positive weights preserves both the source draw and
+  // search trajectory, even when the total confidence is below 1e-8.
+  EXPECT_FLOAT_EQ(result->cost_map.Get(3, 3), weak->cost_map.Get(3, 3));
+  EXPECT_FLOAT_EQ(result->depth_map.Get(3, 3), weak->depth_map.Get(3, 3));
+}
+
+TEST(PatchMatchBackendTest, CudaBackendRejectsLowVarianceMatchingNoise) {
+  if (!IsCudaPatchMatchCompiled()) {
+    GTEST_SKIP() << "CUDA PatchMatch backend is not compiled in this build.";
+  }
+  ASSERT_TRUE(IsCudaPatchMatchAvailable())
+      << CudaPatchMatchUnavailableReason();
+  MvsImage image = MakeGradientImage(5, 5);
+  image.gray = image.gray * 0.05F + 0.5F;
+  PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCuda;
+  options.num_iterations = 0;
+  options.initialization.randomize_initial_normals = false;
+  options.cost.window_radius = 1;
+  const auto rejected = RunPatchMatchStereoForImage(
+      MakeView(1), {MakeView(2)}, image, {image}, 2.0F, 6.0F, options);
+  EXPECT_GT(rejected.cost_map.Get(2, 2), 0.9F);
+  options.cost.min_variance = 1e-8F;
+  const auto accepted = RunPatchMatchStereoForImage(
+      MakeView(1), {MakeView(2)}, image, {image}, 2.0F, 6.0F, options);
+  EXPECT_LT(accepted.cost_map.Get(2, 2), 0.01F);
 }
 
 TEST(PatchMatchBackendTest, CudaBackendRunsExplicitRedBlackCheckerboard) {
@@ -1976,6 +2434,187 @@ TEST(PatchMatchBackendTest,
   ASSERT_TRUE(result->cost_map.IsValid(4, 4));
   EXPECT_GT(result->cost_map.Get(4, 4), options.cost.invalid_cost);
   EXPECT_NEAR(result->cost_map.Get(4, 4), cpu_cost.cost, 2e-4F);
+  request.options.filter.enabled = true;
+  request.options.filter.min_ncc = -1;
+  request.options.filter.min_num_consistent = 1;
+  request.options.filter.min_triangulation_angle_degrees = 0;
+  request.options.filter.geom_consistency_max_cost = 4;
+  const auto filtered = RunCudaPatchMatchStereo(request, &unavailable_reason);
+  ASSERT_TRUE(filtered) << unavailable_reason;
+  ASSERT_TRUE(filtered->filter_graph);
+  EXPECT_TRUE(filtered->depth_map.IsValid(4, 4));
+  EXPECT_EQ(filtered->filter_graph->Count(4, 4), 1);
+  EXPECT_GT(filtered->cost_map.Get(4, 4), options.cost.invalid_cost);
+}
+
+TEST(PatchMatchFinalFilterTest, RequiresNccAndGeometryInTheSameSource) {
+  auto reference = MakeGradientImage(33, 33);
+  reference.gray *= 0.05F;
+  auto reference_view = MakeView(1);
+  reference_view.camera.width = reference_view.camera.height = 33;
+  reference_view.camera.params = InitializeCameraParams(CameraModelId::kPinhole, 10, 33, 33);
+  std::vector<PatchMatchView> views{MakeView(2, 0.3), MakeView(3, -0.3)};
+  for (auto& view : views) {
+    view.camera.width = view.camera.height = 33;
+    view.camera.params = reference_view.camera.params;
+  }
+  std::vector<MvsImage> images{reference, reference};
+  for (std::size_t i = 0; i < images.size(); ++i) {
+    images[i].gray = reference.gray.clone();
+    const int shift = i == 0 ? -1 : 1;
+    for (int row = 0; row < 33; ++row) {
+      for (int col = 0; col < 33; ++col) {
+        const float value = reference.gray.at<float>(row, std::clamp(col + shift, 0, 32));
+        images[i].gray.at<float>(row, col) = i == 0 ? 1.0F - value : value;
+      }
+    }
+  }
+  std::vector<DenseDepthMap> depths{DenseDepthMap(33, 33), DenseDepthMap(33, 33)};
+  depths[0].Fill(3);
+  depths[1].Fill(6);
+  std::vector<const DenseDepthMap*> pointers{&depths[0], &depths[1]};
+  PatchMatchStereoResult raw;
+  raw.depth_map = DenseDepthMap(33, 33);
+  raw.depth_map.Set(16, 16, 3);
+  raw.normal_map = NormalMap(33, 33);
+  raw.normal_map.Set(16, 16, Eigen::Vector3f(0, 0, 1));
+  raw.cost_map = DenseCostMap(33, 33);
+  raw.cost_map.Set(16, 16, 5);
+  PatchMatchCostOptions cost;
+  cost.window_radius = 1;
+  cost.geometric_consistency_weight = 100;
+  PatchMatchFilterOptions filter;
+  filter.enabled = true;
+  filter.min_ncc = 0.1F;
+  filter.min_num_consistent = 1;
+  filter.geom_consistency_max_cost = 0.1F;
+  std::vector<DenseCostMap> posteriors{DenseCostMap(33, 33, 0.1F), DenseCostMap(33, 33, 0.9F)};
+  auto rejected = raw;
+  FilterPatchMatchStereoResult(reference_view, views, reference, images, &pointers, cost, filter, &rejected, {}, &posteriors);
+  ASSERT_TRUE(rejected.filter_graph);
+  EXPECT_EQ(rejected.filter_graph->Count(16, 16), 0);
+  EXPECT_FALSE(rejected.depth_map.IsValid(16, 16));
+  EXPECT_FALSE(rejected.normal_map.IsValid(16, 16));
+  EXPECT_FALSE(rejected.cost_map.IsValid(16, 16));
+  depths[1].Fill(3);
+  auto accepted = raw;
+  FilterPatchMatchStereoResult(reference_view, views, reference, images, &pointers, cost, filter, &accepted, {}, &posteriors);
+  ASSERT_TRUE(accepted.depth_map.IsValid(16, 16));
+  ASSERT_EQ(accepted.filter_graph->Count(16, 16), 1);
+  EXPECT_EQ(accepted.filter_graph->SourceImageIds(16, 16).front(), 3);
+  EXPECT_FLOAT_EQ(accepted.cost_map.Get(16, 16), 5);  // Optimization cost is not an NCC gate.
+  const std::vector<ImageId> model_order{1, 2, 3};
+  const auto colmap_data = accepted.filter_graph->ToColmapData(model_order);
+  EXPECT_EQ(colmap_data, (std::vector<int>{16, 16, 1, 2}));
+  const auto imported = ConsistencyGraph::FromColmapData(33, 33, colmap_data, model_order);
+  ASSERT_EQ(imported.Count(16, 16), 1);
+  EXPECT_EQ(imported.SourceImageIds(16, 16).front(), 3);
+  filter.min_num_consistent = 2;
+  auto insufficient = raw;
+  FilterPatchMatchStereoResult(reference_view, views, reference, images, &pointers, cost, filter, &insufficient, {}, &posteriors);
+  EXPECT_FALSE(insufficient.depth_map.IsValid(16, 16));
+
+  // COLMAP accepts zero as an explicitly disabled source-count threshold.
+  filter.min_num_consistent = 0;
+  filter.min_ncc = 1.0F;
+  for (auto& posterior : posteriors) posterior.Fill(0.0F);
+  auto zero_threshold = raw;
+  FilterPatchMatchStereoResult(reference_view, views, reference, images, &pointers,
+      cost, filter, &zero_threshold, {}, &posteriors);
+  EXPECT_TRUE(zero_threshold.depth_map.IsValid(16, 16));
+  EXPECT_FLOAT_EQ(zero_threshold.cost_map.Get(16, 16), 5);
+  EXPECT_EQ(zero_threshold.filter_graph->Count(16, 16), 0);
+  filter.min_ncc = 0.1F;
+
+  if (!IsCudaPatchMatchAvailable()) return;
+  PatchMatchMaps initial{raw.depth_map, raw.normal_map};
+  initial.depth_map.Fill(3);
+  initial.normal_map.Fill(Eigen::Vector3f(0, 0, 1));
+  CudaPatchMatchRequest request;
+  request.reference_view = &reference_view;
+  request.source_views = &views;
+  request.reference_image = &reference;
+  request.source_images = &images;
+  request.source_depth_map_ptrs = &pointers;
+  request.initial_maps = &initial;
+  request.depth_min = 2;
+  request.depth_max = 4;
+  request.options.num_iterations = 0;
+  request.options.cost = cost;
+  request.options.filter = filter;
+  request.options.filter.min_num_consistent = 1;
+  // Even with zero geometric optimization weight, supplied source depths
+  // must still participate in final geometric filtering.
+  request.options.cost.geometric_consistency_weight = 0;
+  for (const float source_depth : {6.0F, 3.0F}) {
+    depths[1].Fill(source_depth);
+    std::string reason;
+    const auto cuda = RunCudaPatchMatchStereo(request, &reason);
+    ASSERT_TRUE(cuda) << reason;
+    ASSERT_TRUE(cuda->filter_graph);
+    EXPECT_EQ(cuda->depth_map.IsValid(16, 16), source_depth == 3);
+    EXPECT_EQ(cuda->filter_graph->Count(16, 16), source_depth == 3 ? 1 : 0);
+  }
+  // Keep a full plane through nearest-neighbor pyramid resampling; an isolated
+  // valid pixel is not guaranteed to survive every coarse grid.
+  initial.depth_map.Fill(3);
+  initial.normal_map.Fill(Eigen::Vector3f(0, 0, 1));
+  request.options.pyramid_levels = 3;
+  std::string reason;
+  const auto pyramid = RunCudaPatchMatchStereo(request, &reason);
+  ASSERT_TRUE(pyramid) << reason;
+  ASSERT_TRUE(pyramid->filter_graph);
+  EXPECT_TRUE(pyramid->depth_map.IsValid(16, 16));
+  EXPECT_EQ(pyramid->filter_graph->Count(16, 16), 1);
+  request.options.pyramid_levels = 1;
+  request.options.normal_refinement.enabled = true;
+  const auto refined = RunCudaPatchMatchStereo(request, &reason);
+  ASSERT_TRUE(refined) << reason;
+  ASSERT_TRUE(refined->filter_graph);
+  EXPECT_TRUE(refined->depth_map.IsValid(16, 16));
+  request.options.source_selection.dynamic_probability = true;
+  request.options.source_selection.directional_hmm = true;
+  request.options.collect_diagnostics = false;
+  const auto history_after_normals = RunCudaPatchMatchStereo(request, &reason);
+  ASSERT_TRUE(history_after_normals) << reason;
+  EXPECT_TRUE(history_after_normals->depth_map.IsValid(16, 16));
+  request.options.filter.min_num_consistent = 0;
+  request.options.filter.min_ncc = 1.0F;
+  request.options.cost.geometric_max_reprojection_error = 0;
+  const auto zero_threshold_cuda = RunCudaPatchMatchStereo(request, &reason);
+  ASSERT_TRUE(zero_threshold_cuda) << reason;
+  EXPECT_TRUE(zero_threshold_cuda->depth_map.IsValid(16, 16));
+  EXPECT_EQ(history_after_normals->summary.cuda_async_output_readbacks, 2);
+}
+
+TEST(PatchMatchFinalFilterTest, ValidatesThresholds) {
+  PatchMatchFilterOptions filter;
+  for (float value : {-1.1F, 1.1F, std::numeric_limits<float>::quiet_NaN()}) {
+    filter.min_ncc = value;
+    EXPECT_THROW(ValidatePatchMatchFilterOptions(filter), std::invalid_argument);
+  }
+  filter = {};
+  filter.min_num_consistent = 0;
+  EXPECT_NO_THROW(ValidatePatchMatchFilterOptions(filter));
+}
+
+TEST(PatchMatchFinalFilterTest, UsesColmapHmmMessagesAndProbabilityScale) {
+  const float emission = ComputePatchMatchNccLikelihood(0.9F, 0.6F);
+  EXPECT_NEAR(emission, 0.432F, 0.002F);
+  const float previous = 0.3F;
+  const float stay = 0.99999F, change = 1.0F - stay;
+  const float yes = (previous * stay + (1 - previous) * change) * emission;
+  const float no = (previous * change + (1 - previous) * stay) * 0.5F;
+  EXPECT_FLOAT_EQ(detail::HmmForward(emission, previous), yes / (yes + no));
+  EXPECT_FLOAT_EQ(detail::HmmForward(-emission, previous), yes / (yes + no));
+  const float backward_yes = previous * emission * stay + (1 - previous) * 0.5F * change;
+  const float backward_no = previous * emission * change + (1 - previous) * 0.5F * stay;
+  EXPECT_FLOAT_EQ(detail::HmmBackward(emission, previous), backward_yes / (backward_yes + backward_no));
+  // HMM probabilities are not clamped to the source-pruning interval.
+  EXPECT_GT(detail::HmmSelection(0.9999F, 0.9999F, 0.5F, 0), 0.999F);
+  // The likelihood is a density, not a probability bounded by one. This
+  // deliberately preserves COLMAP's high filter_min_ncc threshold behavior.
+  EXPECT_GT(ComputePatchMatchNccLikelihood(0.2F, 0.6F), 1.0F);
 }
 
 TEST(PatchMatchBackendTest, CudaBackendRejectsOccludedCandidateDespiteOneConsistentSource) {
@@ -2580,6 +3219,93 @@ TEST(CpuStereoFusionTest, UsesFallbackSourcesWithoutConsistencyGraphs) {
   EXPECT_EQ(result.summary.num_fused_observations, 2U);
 }
 
+TEST(CpuStereoFusionTest, PreloadedSeedProjectionCacheResetsForEveryPixel) {
+  std::vector<std::shared_ptr<const StereoFusionViewData>> data;
+  for (ImageId id = 1; id <= 2; ++id) {
+    auto view = std::make_shared<StereoFusionViewData>();
+    view->image = MakeGradientImage(5, 5);
+    view->image.image_id = id;
+    view->depth_map = DenseDepthMap(5, 5);
+    view->depth_map.Fill(3.0F);
+    view->depth_map.Set(2, 2, 4.0F);
+    view->normal_map = NormalMap(5, 5);
+    view->normal_map.Fill(Eigen::Vector3f(0, 0, 1));
+    view->fallback_source_image_ids = {id == 1 ? 2U : 1U};
+    data.push_back(std::move(view));
+  }
+  StereoFusionOptions options;
+  options.require_cost_map = false;
+  options.require_consistency_graph = false;
+  options.prefer_fallback_source_images = true;
+  options.min_num_fused_observations = 2;
+  options.preload_views = true;
+  options.collect_diagnostics = false;
+  std::atomic<int> load_count{0};
+  const auto result = FuseStereoDepthMapsWithViewCache(
+      {MakeView(1), MakeView(2)}, [&](std::size_t i) {
+        ++load_count;
+        return data[i];
+      }, options);
+  EXPECT_EQ(load_count.load(), 2);
+  ASSERT_EQ(result.points.size(), 25U);
+  for (const auto& point : result.points) {
+    const double depth = point.row == 2 && point.col == 2 ? 4.0 : 3.0;
+    EXPECT_NEAR(point.xyz.x(), (static_cast<double>(point.col) - 2.5) / 10.0 * depth, 1e-9);
+    EXPECT_NEAR(point.xyz.y(), (static_cast<double>(point.row) - 2.5) / 10.0 * depth, 1e-9);
+    EXPECT_NEAR(point.xyz.z(), depth, 1e-9);
+  }
+}
+
+TEST(CpuStereoFusionTest, PreloadPropagatesLoaderFailures) {
+  StereoFusionOptions options;
+  options.preload_views = true;
+  EXPECT_THROW(
+      FuseStereoDepthMapsWithViewCache(
+          {MakeView(1), MakeView(2)},
+          [](std::size_t) -> std::shared_ptr<const StereoFusionViewData> {
+            throw std::runtime_error("Failed to load dense view");
+          }, options),
+      std::runtime_error);
+  EXPECT_THROW(
+      FuseStereoDepthMapsWithViewCache(
+          {MakeView(1), MakeView(2)},
+          [](std::size_t) -> std::shared_ptr<const StereoFusionViewData> {
+            return nullptr;
+          }, options),
+      std::runtime_error);
+}
+
+TEST(CpuStereoFusionTest, RejectsOutsideProjectionsBeforeLoadingSourceMaps) {
+  std::vector<std::shared_ptr<const StereoFusionViewData>> data;
+  for (ImageId id = 1; id <= 3; ++id) {
+    auto view = std::make_shared<StereoFusionViewData>();
+    view->image = MakeGradientImage(5, 5);
+    view->image.image_id = id;
+    view->depth_map = DenseDepthMap(5, 5, 1.0F, 5.0F);
+    view->depth_map.Set(2, 2, 3.0F);
+    view->normal_map = NormalMap(5, 5);
+    view->normal_map.Set(2, 2, Eigen::Vector3f(0, 0, 1));
+    if (id < 3) view->fallback_source_image_ids = {3};
+    data.push_back(std::move(view));
+  }
+  std::atomic<int> third_view_loads{0};
+  StereoFusionOptions options;
+  options.require_cost_map = false;
+  options.require_consistency_graph = false;
+  options.prefer_fallback_source_images = true;
+  options.min_num_fused_observations = 2;
+  const auto result = FuseStereoDepthMapsWithViewCache(
+      {MakeView(1), MakeView(2), MakeView(3, 100.0)},
+      [&](std::size_t index) {
+        if (index == 2) ++third_view_loads;
+        return data.at(index);
+      }, options);
+  EXPECT_TRUE(result.points.empty());
+  // Initial validation, the third reference, and its current BFS cursor.
+  // References 1 and 2 must not load the out-of-frustum third source.
+  EXPECT_EQ(third_view_loads.load(), 3);
+}
+
 TEST(CpuStereoFusionTest, RoundTripsColmapPointsVisibilityBinary) {
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() /
@@ -2697,7 +3423,7 @@ TEST(CpuStereoFusionTest, UsesBilinearSourceDepthForFusionValidation) {
   depth1.Set(2, 2, 3.0F);
   DenseDepthMap depth2(5, 5, 1.0F, 5.0F);
   // 源图投影约为 (2.6, 2.0)。最近像素深度为 3.1，离散检查会失败；
-  // 但 (2,2)-(3,2) 的双线性插值深度为 3.0，应与几何一致性图一致地通过。
+  // 但 (2,2)-(3,2) 的双线性插值深度为 3.0，Fusion 保持该采样规则。
   depth2.Set(2, 2, 2.85F);
   depth2.Set(2, 3, 3.10F);
   depth2.Set(3, 2, 2.85F);

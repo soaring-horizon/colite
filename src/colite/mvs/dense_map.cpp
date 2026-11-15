@@ -8,6 +8,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <opencv2/imgproc.hpp>
 
 namespace colite::mvs {
 namespace {
@@ -64,6 +66,116 @@ std::pair<std::size_t, std::size_t> ReadColmapDenseMapHeader(
 
 }  // namespace
 
+void WriteDenseDepthMapColmapBinary(const std::filesystem::path& path,
+                                   const DenseDepthMap& map) {
+  if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
+  std::ofstream file(path, std::ios::binary);
+  file << map.Width() << '&' << map.Height() << "&1&";
+  file.write(reinterpret_cast<const char*>(map.Data().data()),
+             static_cast<std::streamsize>(map.NumPixels() * sizeof(float)));
+  RequireBinaryStream(static_cast<bool>(file), path);
+}
+
+void WriteNormalMapColmapBinary(const std::filesystem::path& path,
+                               const NormalMap& map) {
+  if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
+  std::ofstream file(path, std::ios::binary);
+  file << map.Width() << '&' << map.Height() << "&3&";
+  std::vector<float> channel(map.NumPixels());
+  for (int component = 0; component < 3; ++component) {
+    for (std::size_t i = 0; i < channel.size(); ++i) channel[i] = map.Data()[i][component];
+    file.write(reinterpret_cast<const char*>(channel.data()),
+               static_cast<std::streamsize>(channel.size() * sizeof(float)));
+  }
+  RequireBinaryStream(static_cast<bool>(file), path);
+}
+
+std::pair<std::size_t, std::size_t> ReadDenseDepthMapSize(
+    const std::filesystem::path& path, bool binary) {
+  std::ifstream file(path, std::ios::binary);
+  RequireStream(static_cast<bool>(file), path);
+  std::size_t width = 0, height = 0;
+  if (binary && std::isdigit(static_cast<unsigned char>(file.peek()))) {
+    std::tie(width, height) = ReadColmapDenseMapHeader(file, 1, path);
+  } else {
+    std::string magic;
+    int version = 0;
+    float min_depth = 0, max_depth = 0;
+    file >> magic >> version >> width >> height >> min_depth >> max_depth;
+    RequireStream(static_cast<bool>(file) && version == 1 &&
+        magic == (binary ? kDepthMapBinaryMagic : kDepthMapMagic), path);
+    file.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+  }
+  RequireStream(width > 0 && height > 0 &&
+      width <= std::numeric_limits<std::size_t>::max() / height / sizeof(float), path);
+  if (binary) {
+    const auto offset = file.tellg();
+    RequireBinaryStream(offset >= 0 && std::filesystem::file_size(path) >=
+        static_cast<std::uintmax_t>(offset) && std::filesystem::file_size(path) -
+        static_cast<std::uintmax_t>(offset) == width * height * sizeof(float), path);
+  }
+  return {width, height};
+}
+
+std::pair<std::size_t, std::size_t> DenseMapDownsizeShape(
+    std::size_t width, std::size_t height,
+    std::size_t max_width, std::size_t max_height) {
+  if (width == 0 || height == 0 || max_width == 0 || max_height == 0) {
+    throw std::invalid_argument("Dense map dimensions must be positive");
+  }
+  const double scale = std::min({1.0, double(max_width) / width, double(max_height) / height});
+  return {std::max<std::size_t>(1, std::lround(width * scale)),
+          std::max<std::size_t>(1, std::lround(height * scale))};
+}
+
+void DownsizeDepthNormalMaps(std::size_t max_width, std::size_t max_height,
+                             DenseDepthMap* depth, NormalMap* normals) {
+  if (depth == nullptr || normals == nullptr || depth->Empty() ||
+      depth->Width() != normals->Width() || depth->Height() != normals->Height()) {
+    throw std::invalid_argument("Depth and normal maps must have matching nonempty dimensions");
+  }
+  const auto [width, height] = DenseMapDownsizeShape(
+      depth->Width(), depth->Height(), max_width, max_height);
+  if (width == depth->Width() && height == depth->Height()) return;
+  const auto kernel = [](double scale) {
+    const double sigma = std::max(1e-8, 0.5 * (scale - 1.0));
+    const int radius = static_cast<int>(std::ceil(3.0 * sigma));
+    return cv::getGaussianKernel(2 * radius + 1, sigma, CV_32F);
+  };
+  const auto kx = kernel(double(depth->Width()) / width);
+  const auto ky = kernel(double(depth->Height()) / height);
+  const auto downsample = [&](const cv::Mat& input) {
+    cv::Mat smooth, result;
+    cv::sepFilter2D(input, smooth, -1, kx, ky, cv::Point(-1, -1), 0, cv::BORDER_REPLICATE);
+    cv::resize(smooth, result, cv::Size(static_cast<int>(width), static_cast<int>(height)),
+               0, 0, cv::INTER_LINEAR);
+    return result;
+  };
+  const cv::Mat depth_pixels(static_cast<int>(depth->Height()),
+      static_cast<int>(depth->Width()), CV_32F, depth->MutableData().data());
+  cv::Mat normal_pixels(depth_pixels.size(), CV_32FC3);
+  for (std::size_t row = 0; row < depth->Height(); ++row) {
+    for (std::size_t col = 0; col < depth->Width(); ++col) {
+      const auto normal = normals->Get(row, col);
+      normal_pixels.at<cv::Vec3f>(row, col) = {normal.x(), normal.y(), normal.z()};
+    }
+  }
+  const auto resized_depth = downsample(depth_pixels);
+  const auto resized_normal = downsample(normal_pixels);
+  DenseDepthMap output_depth(width, height);
+  std::copy_n(resized_depth.ptr<float>(), width * height, output_depth.MutableData().begin());
+  output_depth.RecomputeDepthRange();
+  NormalMap output_normal(width, height);
+  for (std::size_t row = 0; row < height; ++row) {
+    for (std::size_t col = 0; col < width; ++col) {
+      const auto value = resized_normal.at<cv::Vec3f>(row, col);
+      output_normal.SetNormalized(row, col, Eigen::Vector3f(value[0], value[1], value[2]));
+    }
+  }
+  *depth = std::move(output_depth);
+  *normals = std::move(output_normal);
+}
+
 DenseDepthMap::DenseDepthMap(std::size_t width,
                              std::size_t height,
                              float depth_min,
@@ -73,22 +185,6 @@ DenseDepthMap::DenseDepthMap(std::size_t width,
       depth_min_(depth_min),
       depth_max_(depth_max),
       data_(width * height, 0.0F) {}
-
-std::size_t DenseDepthMap::Width() const {
-  return width_;
-}
-
-std::size_t DenseDepthMap::Height() const {
-  return height_;
-}
-
-std::size_t DenseDepthMap::NumPixels() const {
-  return data_.size();
-}
-
-bool DenseDepthMap::Empty() const {
-  return data_.empty();
-}
 
 float DenseDepthMap::DepthMin() const {
   return depth_min_;
@@ -115,16 +211,8 @@ void DenseDepthMap::Fill(float value) {
   std::fill(data_.begin(), data_.end(), value);
 }
 
-float DenseDepthMap::Get(std::size_t row, std::size_t col) const {
-  return data_.at(Offset(row, col));
-}
-
 void DenseDepthMap::Set(std::size_t row, std::size_t col, float depth) {
   data_.at(Offset(row, col)) = depth;
-}
-
-bool DenseDepthMap::IsValid(std::size_t row, std::size_t col) const {
-  return IsValidDepthValue(Get(row, col));
 }
 
 std::size_t DenseDepthMap::ValidPixelCount() const {
@@ -152,41 +240,14 @@ bool DenseDepthMap::RecomputeDepthRange() {
   return true;
 }
 
-const std::vector<float>& DenseDepthMap::Data() const {
-  return data_;
-}
-
 std::vector<float>& DenseDepthMap::MutableData() {
   return data_;
-}
-
-std::size_t DenseDepthMap::Offset(std::size_t row, std::size_t col) const {
-  if (row >= height_ || col >= width_) {
-    throw std::out_of_range("DenseDepthMap pixel index is out of range");
-  }
-  return row * width_ + col;
 }
 
 NormalMap::NormalMap(std::size_t width, std::size_t height)
     : width_(width),
       height_(height),
       data_(width * height, Eigen::Vector3f::Zero()) {}
-
-std::size_t NormalMap::Width() const {
-  return width_;
-}
-
-std::size_t NormalMap::Height() const {
-  return height_;
-}
-
-std::size_t NormalMap::NumPixels() const {
-  return data_.size();
-}
-
-bool NormalMap::Empty() const {
-  return data_.empty();
-}
 
 void NormalMap::Resize(std::size_t width, std::size_t height) {
   width_ = width;
@@ -196,10 +257,6 @@ void NormalMap::Resize(std::size_t width, std::size_t height) {
 
 void NormalMap::Fill(const Eigen::Vector3f& normal) {
   std::fill(data_.begin(), data_.end(), normal);
-}
-
-Eigen::Vector3f NormalMap::Get(std::size_t row, std::size_t col) const {
-  return data_.at(Offset(row, col));
 }
 
 void NormalMap::Set(std::size_t row,
@@ -218,50 +275,19 @@ void NormalMap::SetNormalized(std::size_t row,
   Set(row, col, normal.normalized());
 }
 
-bool NormalMap::IsValid(std::size_t row, std::size_t col) const {
-  return IsValidNormalValue(Get(row, col));
-}
-
 std::size_t NormalMap::ValidPixelCount() const {
   return static_cast<std::size_t>(
       std::count_if(data_.begin(), data_.end(), IsValidNormalValue));
-}
-
-const std::vector<Eigen::Vector3f>& NormalMap::Data() const {
-  return data_;
 }
 
 std::vector<Eigen::Vector3f>& NormalMap::MutableData() {
   return data_;
 }
 
-std::size_t NormalMap::Offset(std::size_t row, std::size_t col) const {
-  if (row >= height_ || col >= width_) {
-    throw std::out_of_range("NormalMap pixel index is out of range");
-  }
-  return row * width_ + col;
-}
-
 DenseCostMap::DenseCostMap(std::size_t width,
                            std::size_t height,
                            float invalid_cost)
     : width_(width), height_(height), data_(width * height, invalid_cost) {}
-
-std::size_t DenseCostMap::Width() const {
-  return width_;
-}
-
-std::size_t DenseCostMap::Height() const {
-  return height_;
-}
-
-std::size_t DenseCostMap::NumPixels() const {
-  return data_.size();
-}
-
-bool DenseCostMap::Empty() const {
-  return data_.empty();
-}
 
 void DenseCostMap::Resize(std::size_t width,
                           std::size_t height,
@@ -275,17 +301,8 @@ void DenseCostMap::Fill(float cost) {
   std::fill(data_.begin(), data_.end(), cost);
 }
 
-float DenseCostMap::Get(std::size_t row, std::size_t col) const {
-  return data_.at(Offset(row, col));
-}
-
 void DenseCostMap::Set(std::size_t row, std::size_t col, float cost) {
   data_.at(Offset(row, col)) = cost;
-}
-
-bool DenseCostMap::IsValid(std::size_t row, std::size_t col) const {
-  const float cost = Get(row, col);
-  return std::isfinite(cost) && cost >= 0.0F;
 }
 
 std::size_t DenseCostMap::ValidPixelCount() const {
@@ -295,19 +312,8 @@ std::size_t DenseCostMap::ValidPixelCount() const {
       }));
 }
 
-const std::vector<float>& DenseCostMap::Data() const {
-  return data_;
-}
-
 std::vector<float>& DenseCostMap::MutableData() {
   return data_;
-}
-
-std::size_t DenseCostMap::Offset(std::size_t row, std::size_t col) const {
-  if (row >= height_ || col >= width_) {
-    throw std::out_of_range("DenseCostMap pixel index is out of range");
-  }
-  return row * width_ + col;
 }
 
 void WriteDenseDepthMapText(const std::filesystem::path& path,

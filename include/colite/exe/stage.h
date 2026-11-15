@@ -22,6 +22,10 @@ struct StageSpec {
   std::vector<std::string> arguments;
 };
 
+enum class StageInputState { kUnrecorded, kMatching, kChanged };
+// Distinguish external inputs from outputs owned by an older configuration.
+StageInputState InspectStageInputs(const StageSpec& spec);
+
 int RunStage(const StageSpec& spec, const StageOptions& options,
              const std::function<int()>& runner, std::ostream& out,
              std::ostream& err);

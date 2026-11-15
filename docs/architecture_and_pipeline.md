@@ -1,5 +1,21 @@
 # Colite 架构与重建流程
 
+## 桌面工作台与计算引擎
+
+Qt 桌面端位于 `gui/`。
+
+| 目录 | 职责 |
+| --- | --- |
+| `app/` | 程序入口、主窗口及界面编排 |
+| `widgets/` | 2D / 3D 视图、属性面板和参数对话框 |
+| `project/` | 工程、恢复草稿、工作区及模型导出 |
+| `workflow/` | 参数定义、任务计划、进程执行、阶段状态和产物校验 |
+| `assets/` | 图标、样式和 Qt 资源清单 |
+
+桌面端负责工程管理、参数配置、阶段队列、日志与可视化。工作台按节点准备任务，使用同平台安装目录中的 `colite` 子进程执行；算法与文件格式由 `src/colite/` 和 `include/colite/` 实现。CLI 可独立运行同一套算法。暂停和中止由任务队列及进程管理实现，浏览器和 WSL 均非桌面运行依赖。
+
+项目文件仅记录照片引用、参数和工作路径。独立运行目录保留阶段产物，同路径缓存由输入与参数的指纹校验。图像或参数变化后，下游结果需要重新验证或计算。显示使用独立的预览预算，不改写重建产物。操作方法见[桌面使用说明](desktop_user_guide.md)。
+
 ## 总体分层
 
 ```mermaid
@@ -58,7 +74,7 @@ flowchart LR
 
 ```text
 SFM_WORKSPACE/
-  cameras.tsv
+  cameras.txt
   images.tsv
   features/<image_id>.bin
   matches/raw_matches.tsv
@@ -87,6 +103,17 @@ SFM_WORKSPACE/
 `algorithm_version`，否则可能误用旧缓存。性能测试必须使用新的 workspace 或明确清理对应
 stage 缓存。
 
+新写入的 feature v3 以原始 2/4/6 列形状元数据补充内部五字段关键点，校验和覆盖形状及描述子；
+内部提取器不分配逐点外部形状矩阵。v1/v2 可读，延迟描述子数据源按实际形状区段计算偏移。
+离线工具可在该 workspace 与 COLMAP 4 数据库之间双向交换特征、raw 和新版 verified。
+数据库 schema 由实际 COLMAP 创建，Colite 运行时存储没有迁移。verified v2 在同一个 TSV
+中按 pair 保存 F/E/H、相对位姿和 presence bits，内点行保持 13 列；空对、configuration
+和缺失字段均保留，完整验证文件后才更新图。反向 pair 同步交换索引、转置 E/F、求逆 H/位姿。
+旧 verified 只能读取，不能作为完整 verified 反向导出。mapper 在内存中恢复缺失的
+CALIBRATED/UNCALIBRATED 的 E/F 位姿、平面/全景的 H 位姿及视差，不更改源文件。
+匹配默认 compute_relative_pose=false；PLANAR_OR_PANORAMIC 在恢复位姿后才分为平面或全景，
+纯旋转不进入平移初始化。初始化接受有非零基线位姿的标定、未标定和平面对。
+
 ## MVS 与完整流程产物
 
 ```text
@@ -97,10 +124,9 @@ OUTPUT/
     points3D.txt
     points3D.ply
   mvs/
-    undistorted/
-      images/
-      sparse/
-      images.tsv
+    images/
+    sparse/
+    images.tsv
     stereo/
       depth_maps/
       normal_maps/
@@ -108,21 +134,24 @@ OUTPUT/
       consistency_graphs*/
       patch_match.tsv
     dense/
-      fused.ply
-      points_visibility.bin
       fusion_tracks.tsv
+    fused.ply
+    fused.ply.vis
   surface/
     meshed-poisson.ply 或 meshed-delaunay.ply
     mesh-simplified.ply
     textured/
-      mesh.obj
-      mesh.mtl
+      mesh.ply
       texture.png
   .colite/stages/
     <stage>.json
 ```
 
-Dense map 支持 text 和 COLMAP 风格 binary。`stereo_fusion` 只读取已存在的深度、法线和一致性图，不会隐式重跑 PatchMatch；持久化几何过滤已经把无效掩码同步写入 depth/normal，因此该路径不再重复解析 text cost map。
+Dense map 默认保存标准 photometric/geometric binary；TXT 和 cost map 仅作为显式调试输出。
+`stereo_fusion` 只读取已存在的深度、法线图，不会隐式重跑 PatchMatch；持久化几何过滤已经把无效掩码同步写入 depth/normal。
+Fusion 文件与 sparse/ 同级，工作区可直接被两端 dense Delaunay 消费；附加诊断、清理点云和
+组合 MVS 的表面产物仍可放在 dense/。独立 sparse Delaunay 直接从 COLMAP 模型轨迹建图。
+纹理 PLY 默认 BIN，可选 TXT，引用 PNG；OBJ/MTL 只在启用 Colite 扩展时附加写出。
 
 ## Stage manifest
 
@@ -138,6 +167,35 @@ Dense map 支持 text 和 COLMAP 风格 binary。`stereo_fusion` 只读取已存
 
 manifest 保存 schema、状态、输入指纹、参数指纹、耗时和声明输出。只有指纹一致且所有声明输出存在时，`--resume` 才跳过；`--force` 强制执行；二者互斥。`--dry_run` 只打印计划，不读取或写入重建产物。
 
+光度图复用由 MVS 控制器单独管理，独立命令、组合命令和库调用共用
+`.colite/photometric_cache.txt`。身份采用解析后的参数、源列表、稀疏初值、相机和图像文件，
+不依赖命令名称或参数排列；Fusion 参数不进入光度身份。执行前写 running，全部成功后
+原子替换 complete，并保存自有 photo depth/normal 的文件指纹。独立 PatchMatch stage
+也把该记录纳入输出指纹，防止恢复时跳过未完成的替换。旧 Colite 产物缺少可信记录时重算，
+全新外部工作区仍可借用标准 photometric maps；公开数据格式不变。
+
+SfM 的 `workspace/cache/*.txt` 使用私有 schema 2：缓存清单以完整标记和FNV校验
+结束，临时文件关闭成功后原子发布；声明的文件及目录递归记录大小/修改时间指纹。
+旧、截断或被改写的清单按缓存未命中处理。matching/geometry/sparse的声明包含其
+特征、相机和图像清单依赖；组合SfM还检查原始/验证匹配、子模型、双格式产物与
+子缓存记录。feature重算后不能复用旧frontend，缓存标记在输出流关闭后保存。
+`recon_auto` 外层也检查这些产物，`resume/force`控制旗标不参与其阶段身份。
+这保持COLMAP数据格式与算法不变；指纹使用文件元数据，未逐字节校验所有产物内容。
+
+组合SfM分别维护matching与geometry身份：`raw_matches.tsv`只保存首次描述子匹配，
+guided更新只进入verified几何。matching身份包含特征、匹配后端/阈值及配对控制；
+geometry身份继续包含matching身份、求解构建能力、两视图与guided参数。
+因此仅改变几何参数或求解构建时保留raw，改变匹配阈值或特征时逐层重算；
+删除/截断raw同样重算匹配，删除verified则只重算几何。CUDA流水线移动其initial
+对应缓冲，CPU在guided前保存raw，冷/热诊断都读取canonical raw语义。
+日志分别报告`Raw match cache hit`与`Geometry cache hit`，不新增用户参数。
+
+`ImageReader.mask_path`与`ImageReader.camera_mask_path`共用特征后处理，保留相同的
+关键点/描述子/原始shape行。遮罩按编码原图坐标采样，Colite内部的EXIF朝向变换会
+先映回该坐标；不缩放遮罩，不在过滤后补足特征预算。遮罩内容指纹进入feature身份并
+逐级传递到匹配、几何和重建，Auto也在计划/跳过前验证并计算内容身份。
+图像的逻辑相对路径用于遮罩名称、模型图名及按目录相机分组，符号链接的物理目标不改写这些名称。
+
 ## SfM 数据流
 
 1. 递归枚举图像并保留相对路径，解码每张图像的尺寸及 EXIF Make、Model、
@@ -147,7 +205,7 @@ manifest 保存 schema、状态、输入指纹、参数指纹、耗时和声明�
    `FeatureSet`。
 2. pair generator 生成 exhaustive/sequential/spatial/vocabulary 候选。
 3. BF/FLANN 匹配，执行 ratio、cross-check、两视图几何和 guided rematch。
-4. Reconstruction Manager 按 verified 图的连通分量依次运行 Incremental Mapper；若提供已有
+4. 增量模式由 Reconstruction Manager 按 verified 图的连通分量运行 Incremental Mapper；若提供已有
    COLMAP text model，则先按图像名重映射 ID，恢复位姿、内参、点和 track，再继续注册新增或
    尚未注册的图像。
 5. `IncrementalTriangulator` 先 Continue，再用 point-centric multi-view Create 建点。
@@ -156,6 +214,8 @@ manifest 保存 schema、状态、输入指纹、参数指纹、耗时和声明�
    图像、点和观测，再执行一次增量补注册及全局精化；不能可靠对齐的模型保持独立。
 8. 从所有注册观测提取稀疏点 RGB，分别导出多个 COLMAP text model 和 PLY，并将最大模型同步
    写到兼容根目录。
+
+全局模式根据已验证的相对位姿建立位姿图，执行旋转平均、位置估计、轨迹三角化和全局 BA。全局模式使用已匹配的工作区重新求解，不接续已有稀疏模型。CLI 还提供分层模式；其构建能力和参数见[命令行参考](cli_reference.md)。
 
 ## MVS 数据流
 

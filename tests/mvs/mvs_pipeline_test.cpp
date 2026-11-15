@@ -74,6 +74,28 @@ Reconstruction MakeSparseReconstruction() {
   return reconstruction;
 }
 
+TEST(MvsPipelineTest, OverlapBatchMatchesUngatedColmapSourceRanking) {
+  auto reconstruction = MakeSparseReconstruction();
+  // Duplicated observations in one track must not count as extra shared points.
+  reconstruction.GetPoint3D(1).track.AddElement(2, 0);
+  MvsPipelineOptions options;
+  options.source_selection_mode = SourceSelectionMode::kColmap;
+  options.min_triangulation_angle_degrees = 0;
+  for (const std::size_t limit : {0U, 1U, 50U}) {
+    options.max_num_source_images = limit;
+    const auto batch = ComputeOverlappingImages(reconstruction, limit);
+    for (const ImageId id : reconstruction.RegisteredImageIds()) {
+      const auto individual = SelectSourceImages(reconstruction, id, options);
+      ASSERT_EQ(batch.at(id).size(), individual.size());
+      for (std::size_t i = 0; i < individual.size(); ++i) {
+        EXPECT_EQ(batch.at(id)[i], individual[i].image_id);
+      }
+    }
+  }
+  EXPECT_EQ(ComputeOverlappingImages(reconstruction, 50, 2).at(2),
+            std::vector<ImageId>({1}));
+}
+
 TEST(MvsPipelineTest, DefaultsToEightSourceImagesForDenserCoverage) {
   const MvsPipelineOptions options;
 

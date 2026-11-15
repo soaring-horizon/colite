@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 
 #include <glog/logging.h>
@@ -87,7 +88,12 @@ bool OutputsExist(const StageSpec& spec) {
   return !spec.outputs.empty() &&
          std::all_of(spec.outputs.begin(), spec.outputs.end(),
                      [&](const auto& path) {
-                       return std::filesystem::exists(path, error);
+                       if (std::filesystem::is_regular_file(path, error)) {
+                         return std::filesystem::file_size(path, error) > 0 &&
+                                !error;
+                       }
+                       return std::filesystem::is_directory(path, error) &&
+                              !std::filesystem::is_empty(path, error) && !error;
                      });
 }
 
@@ -98,13 +104,17 @@ void WriteManifest(const StageSpec& spec, const std::string& status,
   const auto path = spec.output_root / ".colite" / "stages" /
                     (spec.name + ".json");
   std::filesystem::create_directories(path.parent_path());
-  std::ofstream file(path);
+  const std::filesystem::path temporary = path.string() + ".tmp";
+  std::ofstream file(temporary);
   file << "{\n"
-       << "  \"schema_version\": 1,\n"
+       << "  \"schema_version\": 2,\n"
        << "  \"stage\": \"" << JsonEscape(spec.name) << "\",\n"
        << "  \"status\": \"" << status << "\",\n"
        << "  \"input_fingerprint\": \"" << input_fingerprint << "\",\n"
        << "  \"options_fingerprint\": \"" << options_fingerprint
+       << "\",\n"
+       << "  \"output_fingerprint\": \""
+       << (status == "complete" ? FingerprintPaths(spec.outputs) : "")
        << "\",\n"
        << "  \"elapsed_seconds\": " << std::setprecision(9)
        << elapsed_seconds << ",\n  \"outputs\": [";
@@ -113,9 +123,29 @@ void WriteManifest(const StageSpec& spec, const std::string& status,
     file << "\"" << JsonEscape(spec.outputs[i].generic_string()) << "\"";
   }
   file << "]\n}\n";
+  file.close();
+  if (!file) {
+    throw std::runtime_error("Failed to write stage manifest: " + path.string());
+  }
+  // Publish only a complete manifest. Windows needs an explicit replacement
+  // when rename cannot overwrite the old file; an absent manifest is safe.
+  std::error_code error;
+  std::filesystem::rename(temporary, path, error);
+  if (error) {
+    std::filesystem::remove(path);
+    std::filesystem::rename(temporary, path);
+  }
 }
 
 }  // namespace
+
+StageInputState InspectStageInputs(const StageSpec& spec) {
+  const auto manifest = spec.output_root / ".colite" / "stages" / (spec.name + ".json");
+  if (!std::filesystem::exists(manifest)) return StageInputState::kUnrecorded;
+  return ReadJsonString(manifest, "input_fingerprint") == FingerprintPaths(spec.inputs) &&
+                 ReadJsonString(manifest, "options_fingerprint") == FingerprintArguments(spec.arguments)
+      ? StageInputState::kMatching : StageInputState::kChanged;
+}
 
 int RunStage(const StageSpec& spec, const StageOptions& options,
              const std::function<int()>& runner, std::ostream& out,
@@ -132,7 +162,9 @@ int RunStage(const StageSpec& spec, const StageOptions& options,
   if (options.resume && !options.force && OutputsExist(spec) &&
       ReadJsonString(manifest, "status") == "complete" &&
       ReadJsonString(manifest, "input_fingerprint") == input_fingerprint &&
-      ReadJsonString(manifest, "options_fingerprint") == options_fingerprint) {
+      ReadJsonString(manifest, "options_fingerprint") == options_fingerprint &&
+      ReadJsonString(manifest, "output_fingerprint") ==
+          FingerprintPaths(spec.outputs)) {
     out << "SKIP " << spec.name << " (manifest and outputs are current)\n";
     LOG(INFO) << "Stage " << spec.name << " skipped: cache current";
     return 0;
@@ -145,7 +177,11 @@ int RunStage(const StageSpec& spec, const StageOptions& options,
   out << "RUN " << spec.name << "\n";
   const auto begin = std::chrono::steady_clock::now();
   try {
-    const int result = runner();
+    int result = runner();
+    if (result == 0 && !OutputsExist(spec)) {
+      err << "Stage did not produce all required outputs: " << spec.name << "\n";
+      result = 1;
+    }
     const double elapsed = std::chrono::duration<double>(
                                std::chrono::steady_clock::now() - begin)
                                .count();

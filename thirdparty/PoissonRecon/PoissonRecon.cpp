@@ -29,6 +29,8 @@ DAMAGE.
 #include "PreProcessor.h"
 #include "Reconstructors.h"
 
+#include <algorithm>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -588,6 +590,18 @@ void Execute( const AuxDataFactory &auxDataFactory )
 }
 #endif // !FAST_COMPILE
 
+// PLY input otherwise forwards RGB as arbitrary auxiliary properties even
+// without --colors, defeating the embedding application's color option.
+void FilterColorProperties( std::vector< PlyProperty >& properties )
+{
+	if( Colors.set ) return;
+	properties.erase( std::remove_if( properties.begin() , properties.end() ,
+		[]( const PlyProperty& p )
+		{
+			return p.name=="red" || p.name=="green" || p.name=="blue" || p.name=="alpha";
+		} ) , properties.end() );
+}
+
 } // namespace
 
 int RunPoissonRecon( int argc , char* argv[] )
@@ -596,6 +610,8 @@ int RunPoissonRecon( int argc , char* argv[] )
 #ifdef ARRAY_DEBUG
 	MK_WARN( "Array debugging enabled" );
 #endif // ARRAY_DEBUG
+	// Colite embeds this command and can invoke it repeatedly in one process.
+	for( int i=0 ; params[i] ; ++i ) params[i]->set = false;
 	CmdLineParse( argc-1 , &argv[1] , params );
 	if( MaxMemoryGB.value>0 ) SetPeakMemoryMB( MaxMemoryGB.value<<10 );
 	ThreadPool::ChunkSize = ThreadChunkSize.value;
@@ -629,6 +645,7 @@ int RunPoissonRecon( int argc , char* argv[] )
 		bool *readFlags = new bool[ factory.plyReadNum() ];
 		std::vector< PlyProperty > unprocessedProperties;
 		PLY::ReadVertexHeader( In.value , factory , readFlags , unprocessedProperties );
+		FilterColorProperties( unprocessedProperties );
 		if( !factory.template plyValidReadProperties<0>( readFlags ) ) MK_THROW( "Ply file does not contain positions" );
 		if( !factory.template plyValidReadProperties<1>( readFlags ) ) MK_THROW( "Ply file does not contain normals" );
 		delete[] readFlags;
@@ -652,6 +669,7 @@ int RunPoissonRecon( int argc , char* argv[] )
 		bool *readFlags = new bool[ factory.plyReadNum() ];
 		std::vector< PlyProperty > unprocessedProperties;
 		PLY::ReadVertexHeader( In.value , factory , readFlags , unprocessedProperties );
+		FilterColorProperties( unprocessedProperties );
 		if( !factory.template plyValidReadProperties<0>( readFlags ) ) MK_THROW( "Ply file does not contain positions" );
 		if( !factory.template plyValidReadProperties<1>( readFlags ) ) MK_THROW( "Ply file does not contain normals" );
 		delete[] readFlags;

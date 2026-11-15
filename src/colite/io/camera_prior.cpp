@@ -1,4 +1,5 @@
 #include "colite/io/camera_prior.h"
+#include "colite/io/image_reader.h"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,7 @@ constexpr std::uint16_t kExifTagExifIfd = 0x8769;
 constexpr std::uint16_t kExifTagGpsIfd = 0x8825;
 constexpr std::uint16_t kExifTagMake = 0x010F;
 constexpr std::uint16_t kExifTagModel = 0x0110;
+constexpr std::uint16_t kExifTagOrientation = 0x0112;
 constexpr std::uint16_t kExifTagFocalLengthIn35mmFilm = 0xA405;
 constexpr std::uint16_t kExifTagFocalLength = 0x920A;
 constexpr std::uint16_t kExifTagFocalPlaneXResolution = 0xA20E;
@@ -74,46 +76,36 @@ std::optional<std::vector<std::uint8_t>> ReadJpegExifTiff(
     return std::nullopt;
   }
 
-  std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(file),
-                                  std::istreambuf_iterator<char>()};
-  if (bytes.size() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8) {
+  if (file.get() != 0xFF || file.get() != 0xD8) {
     return std::nullopt;
   }
-
-  std::size_t offset = 2;
-  while (offset + 4 <= bytes.size()) {
-    if (bytes[offset] != 0xFF) {
-      return std::nullopt;
-    }
-    const std::uint8_t marker = bytes[offset + 1];
-    offset += 2;
+  // EXIF is a small APP1 header. Never read compressed image pixels just to
+  // obtain camera metadata (this function is used several times per image).
+  while (file.get() == 0xFF) {
+    int marker = file.get();
+    while (marker == 0xFF) marker = file.get();
     if (marker == 0xDA || marker == 0xD9) {
       break;
     }
-    if (offset + 2 > bytes.size()) {
-      return std::nullopt;
-    }
-    const std::uint16_t segment_size =
-        static_cast<std::uint16_t>((bytes[offset] << 8) | bytes[offset + 1]);
-    if (segment_size < 2 || offset + segment_size > bytes.size()) {
-      return std::nullopt;
-    }
-
-    const std::size_t payload_offset = offset + 2;
-    const std::size_t payload_size = segment_size - 2;
+    if (marker < 0) return std::nullopt;
+    if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD8)) continue;
+    const int high = file.get(), low = file.get();
+    if (high < 0 || low < 0) return std::nullopt;
+    const int segment_size = (high << 8) | low;
+    if (segment_size < 2) return std::nullopt;
+    const std::size_t payload_size = static_cast<std::size_t>(segment_size - 2);
     const std::array<std::uint8_t, 6> exif_prefix = {'E', 'x', 'i', 'f', 0, 0};
-    if (marker == 0xE1 && payload_size >= exif_prefix.size() &&
-        std::equal(exif_prefix.begin(), exif_prefix.end(),
-                   bytes.begin() +
-                       static_cast<std::ptrdiff_t>(payload_offset))) {
-      const std::size_t tiff_offset = payload_offset + exif_prefix.size();
-      return std::vector<std::uint8_t>(
-          bytes.begin() + static_cast<std::ptrdiff_t>(tiff_offset),
-          bytes.begin() +
-              static_cast<std::ptrdiff_t>(payload_offset + payload_size));
+    if (marker == 0xE1 && payload_size >= exif_prefix.size()) {
+      std::vector<std::uint8_t> payload(payload_size);
+      file.read(reinterpret_cast<char*>(payload.data()), payload.size());
+      if (!file) return std::nullopt;
+      if (std::equal(exif_prefix.begin(), exif_prefix.end(), payload.begin())) {
+        return std::vector<std::uint8_t>(payload.begin() + exif_prefix.size(),
+                                         payload.end());
+      }
+    } else {
+      file.seekg(static_cast<std::streamoff>(payload_size), std::ios::cur);
     }
-
-    offset += segment_size;
   }
   return std::nullopt;
 }
@@ -359,6 +351,20 @@ ExifCameraMetadata ReadExifCameraMetadata(
   return result;
 }
 
+int ReadExifOrientation(const std::filesystem::path& image_path) {
+  const auto tiff = ReadJpegExifTiff(image_path);
+  if (!tiff.has_value()) return 1;
+  bool little_endian = false;
+  std::uint32_t ifd0_offset = 0;
+  if (!ParseTiffHeader(*tiff, &little_endian, &ifd0_offset)) return 1;
+  const std::optional<std::uint32_t> orientation =
+      ReadIfdUIntValue(*tiff, ifd0_offset, kExifTagOrientation, little_endian);
+  if (!orientation.has_value() || *orientation < 1 || *orientation > 8) {
+    return 1;
+  }
+  return static_cast<int>(*orientation);
+}
+
 std::optional<GeodeticCoordinate> ReadExifGpsCoordinate(
     const std::filesystem::path& image_path) {
   const auto tiff = ReadJpegExifTiff(image_path);
@@ -474,18 +480,18 @@ InitialFocalLengthEstimate EstimateInitialFocalLengthPriorFromImage(
     return {user_focal_length, InitialFocalLengthSource::kUser, true};
   }
 
-  const cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_COLOR);
-  if (image.empty()) {
+  const cv::Size image_size = ReadImageSizeWithExifOrientation(image_path);
+  if (image_size.empty()) {
     throw std::runtime_error("Failed to read image: " + image_path.string());
   }
 
   const double max_dimension = static_cast<double>(
-      std::max(image.cols, image.rows));
+      std::max(image_size.width, image_size.height));
   const auto metadata = ReadExifFocalMetadata(image_path);
   if (metadata.has_value() && metadata->focal_35mm.has_value() &&
       *metadata->focal_35mm > 0.0) {
-    const double diagonal = std::hypot(static_cast<double>(image.cols),
-                                       static_cast<double>(image.rows));
+    const double diagonal = std::hypot(static_cast<double>(image_size.width),
+                                       static_cast<double>(image_size.height));
     return {*metadata->focal_35mm / kFullFrameDiagonalMillimeters * diagonal,
             InitialFocalLengthSource::kExif35mm, true};
   }

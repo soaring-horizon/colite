@@ -1,3 +1,8 @@
+# Only the logging translation unit needs glog's optional stdout flags.
+if(DEFINED glog_VERSION AND glog_VERSION VERSION_GREATER_EQUAL "0.6")
+  set_property(SOURCE exe/logging.cpp APPEND PROPERTY COMPILE_DEFINITIONS COLITE_GLOG_HAS_STDOUT=1)
+endif()
+
 set(COLITE_CUDA_SIFT_SOURCES
   features/backends/cuda_sift_extractor_stub.cpp
 )
@@ -34,6 +39,8 @@ if(COLITE_ENABLE_CUDA_MATCHER)
 endif()
 
 add_library(colite_core
+  ${PROJECT_SOURCE_DIR}/thirdparty/colmap/epnp.cpp
+  ${PROJECT_SOURCE_DIR}/thirdparty/poselib/p3p.cpp
   core/camera.cpp
   core/geometry.cpp
   core/match_graph.cpp
@@ -51,18 +58,26 @@ add_library(colite_core
   features/backends/sift_opencv.cpp
   features/backends/sift_vlfeat.c
   ${COLITE_CUDA_SIFT_SOURCES}
+  features/aliked_extractor.cpp
+  features/onnx_runtime.cpp
   features/sift_extractor.cpp
+  features/feature_mask.cpp
   io/camera_prior.cpp
+  io/image_reader.cpp
+  io/model_resource.cpp
   io/sfm_workspace.cpp
   matching/descriptor_matcher.cpp
+  matching/learned_matcher.cpp
   ${COLITE_CUDA_MATCHER_SOURCES}
   matching/guided_matching.cpp
   matching/match_graph_consistency.cpp
   matching/pair_generator.cpp
   matching/vocabulary_tree.cpp
   matching/two_view_geometry_batch.cpp
+  matching/homography_pose.cpp
   matching/two_view_geometry_verifier.cpp
   matching/weak_pair_rematcher.cpp
+  matching/sift_matching_pipeline.cpp
   mvs/dense_cloud.cpp
   mvs/dense_map.cpp
   mvs/image_workspace.cpp
@@ -71,32 +86,43 @@ add_library(colite_core
   mvs/meshing.cpp
   mvs/mesh_simplifier.cpp
   mvs/mesh_texturer.cpp
+  mvs/textured_mesh_io.cpp
   mvs/patch_match.cpp
   ${COLITE_CUDA_MVS_SOURCES}
   sfm/global_bundle_adjuster.cpp
+  sfm/global_mapper.cpp
+  sfm/global_positioner.cpp
+  sfm/hierarchical_mapper.cpp
   sfm/image_registrar.cpp
   sfm/incremental_initializer.cpp
   sfm/incremental_mapper.cpp
   sfm/incremental_triangulator.cpp
   sfm/local_bundle_adjuster.cpp
+  sfm/model_clusterer.cpp
   sfm/observation_manager.cpp
   sfm/observation_filter.cpp
   sfm/reconstruction_manager.cpp
+  sfm/rotation_averager.cpp
   sfm/similarity_transform.cpp
+  sfm/structureless_registrar.cpp
+  sfm/structureless_resection.cpp
+  sfm/view_graph.cpp
 )
 
 target_include_directories(colite_core
   PUBLIC
     ${PROJECT_SOURCE_DIR}/include
+    ${CMAKE_BINARY_DIR}/generated
     ${OpenCV_INCLUDE_DIRS}
   PRIVATE
+    ${PROJECT_SOURCE_DIR}/thirdparty
     ${CMAKE_CURRENT_SOURCE_DIR}/features
     ${CMAKE_CURRENT_SOURCE_DIR}/features/backends
 )
 
 target_compile_definitions(colite_core
   PUBLIC
-    COLITE_VERSION_STRING="${PROJECT_VERSION}"
+    COLITE_VERSION_STRING="${COLITE_RELEASE_VERSION}"
 )
 
 set_source_files_properties(features/backends/sift_vlfeat.c PROPERTIES
@@ -126,6 +152,11 @@ target_link_libraries(colite_core
     ${LZ4_LIBRARY}
     ${OpenCV_LIBS}
 )
+
+if(COLITE_ENABLE_ONNX)
+  target_link_libraries(colite_core PUBLIC onnxruntime::onnxruntime)
+  target_compile_definitions(colite_core PUBLIC COLITE_ENABLE_ONNX=1)
+endif()
 
 if(PoseLib_FOUND)
   target_link_libraries(colite_core PRIVATE PoseLib::PoseLib)
@@ -166,7 +197,7 @@ if(COLITE_ENABLE_CUDA_MVS)
 endif()
 
 if(MSVC)
-  target_compile_options(colite_core PRIVATE /W4)
+  target_compile_options(colite_core PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:/W4>)
 else()
   target_compile_options(colite_core
     PRIVATE
@@ -175,13 +206,15 @@ else()
   )
 endif()
 
-set_source_files_properties(
-  features/backends/cuda_sift_extractor_stub.cpp
-  matching/descriptor_matcher_cuda_stub.cpp
-  mvs/patch_match_cuda_stub.cpp
-  PROPERTIES
-    COMPILE_OPTIONS "-Wno-pedantic;-Wno-unused-function"
-)
+if(NOT MSVC)
+  set_source_files_properties(
+    features/backends/cuda_sift_extractor_stub.cpp
+    matching/descriptor_matcher_cuda_stub.cpp
+    mvs/patch_match_cuda_stub.cpp
+    PROPERTIES
+      COMPILE_OPTIONS "-Wno-pedantic;-Wno-unused-function"
+  )
+endif()
 
 if(MSVC)
   set(COLITE_OPENCV_SIFT_OPTIONS /utf-8)

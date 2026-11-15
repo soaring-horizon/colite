@@ -63,6 +63,9 @@ target_link_libraries(spatial_matcher PRIVATE colite_sfm_command_exe)
 add_executable(vocab_tree_matcher vocab_tree_matcher_main.cpp)
 target_link_libraries(vocab_tree_matcher PRIVATE colite_sfm_command_exe)
 
+add_executable(transitive_matcher transitive_matcher_main.cpp)
+target_link_libraries(transitive_matcher PRIVATE colite_sfm_command_exe)
+
 add_executable(vocab_tree_builder vocab_tree_builder_main.cpp)
 target_link_libraries(vocab_tree_builder PRIVATE colite_sfm_command_exe)
 
@@ -86,6 +89,7 @@ install(
     sequential_matcher
     spatial_matcher
     vocab_tree_matcher
+    transitive_matcher
     vocab_tree_builder
     mapper
     compare_colmap
@@ -95,12 +99,21 @@ install(
 )
 
 if(MSVC)
+  foreach(executable colite feature_extractor exhaustive_matcher sequential_matcher
+      spatial_matcher vocab_tree_matcher transitive_matcher vocab_tree_builder
+      mapper compare_colmap recon_sfm recon_mvs)
+    target_sources(${executable} PRIVATE "${PROJECT_SOURCE_DIR}/cmake/windows.manifest")
+    target_sources(${executable} PRIVATE "${PROJECT_SOURCE_DIR}/cmake/windows_cli.rc")
+    target_include_directories(${executable} PRIVATE "${PROJECT_SOURCE_DIR}/cmake")
+    target_compile_definitions(${executable} PRIVATE COLITE_EXE_NAME="${executable}" COLITE_EXE_FILENAME="${executable}.exe")
+  endforeach()
   target_compile_options(colite PRIVATE /W4)
   target_compile_options(feature_extractor PRIVATE /W4)
   target_compile_options(exhaustive_matcher PRIVATE /W4)
   target_compile_options(sequential_matcher PRIVATE /W4)
   target_compile_options(spatial_matcher PRIVATE /W4)
   target_compile_options(vocab_tree_matcher PRIVATE /W4)
+  target_compile_options(transitive_matcher PRIVATE /W4)
   target_compile_options(vocab_tree_builder PRIVATE /W4)
   target_compile_options(mapper PRIVATE /W4)
   target_compile_options(compare_colmap PRIVATE /W4)
@@ -113,6 +126,7 @@ else()
   target_compile_options(sequential_matcher PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(spatial_matcher PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(vocab_tree_matcher PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(transitive_matcher PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(vocab_tree_builder PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(mapper PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(compare_colmap PRIVATE -Wall -Wextra -Wpedantic)

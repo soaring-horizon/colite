@@ -40,8 +40,12 @@ struct MultiModelMappingOptions {
   IncrementalMappingOptions mapping;
   ModelMergeOptions merging;
   std::size_t max_num_models = 50;
+  // First nonempty successful model is always kept. Subsequent models must
+  // meet min(configured size, floor(connected input images / 2)). Zero disables
+  // the size filter; initialization still requires a valid two-view model.
   std::size_t min_num_images_per_model = 2;
-  bool merge_models = true;
+  // COLMAP incremental mapping preserves separate models; merging is opt-in.
+  bool merge_models = false;
 };
 
 struct MultiModelMappingResult {

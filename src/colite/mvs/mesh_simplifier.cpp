@@ -7,6 +7,7 @@
 #include <fstream>
 #include <limits>
 #include <queue>
+#include <map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -15,14 +16,19 @@
 #include <utility>
 #include <vector>
 
+#include <Eigen/Cholesky>
+#include <Eigen/LU>
+
+#include "colite/core/parallel.h"
+
 namespace colite::mvs {
 namespace {
 
-constexpr double kPi = 3.14159265358979323846;
 constexpr double kMinAreaSquared = 1e-24;
 
 struct VertexState {
   FusedPoint point;
+  Eigen::Vector3f color = Eigen::Vector3f::Zero();
   Eigen::Matrix4d quadric = Eigen::Matrix4d::Zero();
   std::vector<int> faces;
   std::uint64_t version = 0;
@@ -36,6 +42,7 @@ struct FaceState {
 
 struct CollapseCandidate {
   double error = 0.0;
+  Eigen::Vector3f color = Eigen::Vector3f::Zero();
   int first = -1;
   int second = -1;
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
@@ -46,7 +53,9 @@ struct CollapseCandidate {
 struct GreaterError {
   bool operator()(const CollapseCandidate& lhs,
                   const CollapseCandidate& rhs) const {
-    return lhs.error > rhs.error;
+    if (lhs.error != rhs.error) return lhs.error > rhs.error;
+    if (lhs.first != rhs.first) return lhs.first > rhs.first;
+    return lhs.second > rhs.second;
   }
 };
 
@@ -93,72 +102,62 @@ int ActiveEdgeFaceCount(int first,
   return count;
 }
 
-bool IsBoundaryVertex(int vertex,
-                      const std::vector<VertexState>& vertices,
-                      const std::vector<FaceState>& faces) {
-  for (const int neighbor : ActiveNeighbors(vertex, vertices, faces)) {
-    if (ActiveEdgeFaceCount(vertex, neighbor, vertices, faces) == 1) {
-      return true;
-    }
-  }
-  return false;
-}
-
 double QuadricError(const Eigen::Matrix4d& quadric,
                     const Eigen::Vector3d& position) {
   const Eigen::Vector4d homogeneous(position.x(), position.y(), position.z(),
                                     1.0);
-  return std::max(0.0, homogeneous.dot(quadric * homogeneous));
+  const double error = homogeneous.dot(quadric * homogeneous);
+  return std::isfinite(error) ? std::max(0.0, error)
+                              : std::numeric_limits<double>::infinity();
 }
 
-CollapseCandidate MakeCandidate(int first,
-                                int second,
-                                const std::vector<VertexState>& vertices) {
+CollapseCandidate MakeCandidate(int first, int second,
+                                const std::vector<VertexState>& vertices,
+                                bool interpolate_colors) {
   const auto edge = OrderedEdge(first, second);
   first = edge[0];
   second = edge[1];
-  const Eigen::Matrix4d quadric =
-      vertices[first].quadric + vertices[second].quadric;
-  std::array<Eigen::Vector3d, 4> positions = {
-      vertices[first].point.xyz, vertices[second].point.xyz,
-      0.5 * (vertices[first].point.xyz + vertices[second].point.xyz),
-      Eigen::Vector3d::Zero()};
-  std::size_t num_positions = 3;
-  const Eigen::Matrix3d system = quadric.topLeftCorner<3, 3>();
-  if (std::abs(system.determinant()) > 1e-12) {
-    const Eigen::Vector3d unconstrained =
-        system.ldlt().solve(-quadric.topRightCorner<3, 1>());
-    const Eigen::Vector3d edge_direction =
-        vertices[second].point.xyz - vertices[first].point.xyz;
-    if (unconstrained.allFinite() &&
-        edge_direction.squaredNorm() > std::numeric_limits<double>::epsilon()) {
-      // The unconstrained QEM minimizer can be arbitrarily far from the
-      // collapsed edge for nearly singular local quadrics. Keep the optimal
-      // candidate on the edge segment so simplification cannot expand the
-      // mesh beyond its local one-ring envelope.
-      const double t = std::clamp(
-          (unconstrained - vertices[first].point.xyz).dot(edge_direction) /
-              edge_direction.squaredNorm(),
-          0.0, 1.0);
-      positions[num_positions++] =
-          vertices[first].point.xyz + t * edge_direction;
-    }
-  }
+  const auto& a = vertices[first];
+  const auto& b = vertices[second];
+  const Eigen::Matrix4d quadric = a.quadric + b.quadric;
+  const double error_a = QuadricError(quadric, a.point.xyz);
+  const double error_b = QuadricError(quadric, b.point.xyz);
   CollapseCandidate candidate;
   candidate.first = first;
   candidate.second = second;
-  candidate.first_version = vertices[first].version;
-  candidate.second_version = vertices[second].version;
-  candidate.error = std::numeric_limits<double>::infinity();
-  for (std::size_t i = 0; i < num_positions; ++i) {
-    if (!positions[i].allFinite()) {
-      continue;
+  candidate.first_version = a.version;
+  candidate.second_version = b.version;
+  candidate.position = error_a <= error_b ? a.point.xyz : b.point.xyz;
+  candidate.error = std::min(error_a, error_b);
+  const Eigen::Vector3d midpoint = 0.5 * (a.point.xyz + b.point.xyz);
+  const double error_mid = QuadricError(quadric, midpoint);
+  if (error_mid < candidate.error) {
+    candidate.position = midpoint;
+    candidate.error = error_mid;
+  }
+  // Use the full spatial minimizer. Restricting it to the edge segment changes
+  // the QEM objective and can discard a substantially better surface fit.
+  const Eigen::Matrix3d system = quadric.topLeftCorner<3, 3>();
+  if (std::abs(system.determinant()) > 1e-12) {
+    const Eigen::LDLT<Eigen::Matrix3d> solver(system);
+    const Eigen::Vector3d position = solver.solve(-quadric.topRightCorner<3, 1>());
+    if (solver.info() == Eigen::Success && position.allFinite()) {
+      const double error = QuadricError(quadric, position);
+      if (std::isfinite(error)) {
+        candidate.position = position;
+        candidate.error = error;
+      }
     }
-    const double error = QuadricError(quadric, positions[i]);
-    if (error < candidate.error) {
-      candidate.error = error;
-      candidate.position = positions[i];
-    }
+  }
+  if (interpolate_colors) {
+    const Eigen::Vector3d direction = b.point.xyz - a.point.xyz;
+    const double length_squared = direction.squaredNorm();
+    const float t = length_squared > 0
+        ? static_cast<float>(std::clamp((candidate.position - a.point.xyz).dot(direction) / length_squared, 0.0, 1.0))
+        : 0.5F;
+    candidate.color = (1.0F - t) * a.color + t * b.color;
+  } else {
+    candidate.color = error_a <= error_b ? a.color : b.color;
   }
   return candidate;
 }
@@ -184,7 +183,35 @@ bool SatisfiesLinkCondition(int first,
       ++common;
     }
   }
-  return common == edge_faces;
+  if (common != edge_faces) return false;
+  // Compare the edges of the vertex links too. Vertex-count-only checks miss
+  // a tetrahedron, whose collapse creates two copies of the same triangle.
+  const auto link_edges = [&](int vertex) {
+    std::set<std::array<int, 2>> result;
+    for (const auto face_id : vertices[vertex].faces) {
+      const auto& face = faces[face_id];
+      if (!face.active || !FaceContains(face, vertex)) continue;
+      std::array<int, 2> opposite;
+      int count = 0;
+      for (const auto id : face.vertices) if (id != vertex) opposite[count++] = id;
+      result.insert(OrderedEdge(opposite[0], opposite[1]));
+    }
+    return result;
+  };
+  const auto first_links = link_edges(first);
+  for (const auto& edge : link_edges(second)) {
+    if (first_links.count(edge)) return false;
+  }
+  const auto boundary_vertex = [&](int vertex, const std::vector<int>& neighbors) {
+    for (const auto neighbor : neighbors) {
+      if (ActiveEdgeFaceCount(vertex, neighbor, vertices, faces) == 1) return true;
+    }
+    return false;
+  };
+  // An interior edge between two boundary vertices must not join separate
+  // boundary arcs or collapse the last two faces of an open component.
+  return edge_faces == 1 || !boundary_vertex(first, first_neighbors) ||
+                           !boundary_vertex(second, second_neighbors);
 }
 
 bool PreservesFaceNormals(const CollapseCandidate& candidate,
@@ -230,10 +257,9 @@ bool PreservesFaceNormals(const CollapseCandidate& candidate,
 }
 
 bool CanCollapse(const CollapseCandidate& candidate,
-                 const MeshSimplificationOptions& options,
                  const std::vector<VertexState>& vertices,
                  const std::vector<FaceState>& faces) {
-  if (!vertices[candidate.first].active ||
+  if (!std::isfinite(candidate.error) || !vertices[candidate.first].active ||
       !vertices[candidate.second].active ||
       candidate.first_version != vertices[candidate.first].version ||
       candidate.second_version != vertices[candidate.second].version ||
@@ -241,22 +267,7 @@ bool CanCollapse(const CollapseCandidate& candidate,
                               faces)) {
     return false;
   }
-  if (options.preserve_boundary) {
-    const bool first_boundary =
-        IsBoundaryVertex(candidate.first, vertices, faces);
-    const bool second_boundary =
-        IsBoundaryVertex(candidate.second, vertices, faces);
-    const bool boundary_edge = ActiveEdgeFaceCount(
-                                   candidate.first, candidate.second, vertices,
-                                   faces) == 1;
-    if (first_boundary != second_boundary ||
-        (first_boundary && !boundary_edge)) {
-      return false;
-    }
-  }
-  const double minimum_normal_dot = std::cos(
-      options.max_normal_change_degrees * kPi / 180.0);
-  return PreservesFaceNormals(candidate, minimum_normal_dot, vertices, faces);
+  return PreservesFaceNormals(candidate, 0.0, vertices, faces);
 }
 
 std::size_t Collapse(const CollapseCandidate& candidate,
@@ -265,17 +276,7 @@ std::size_t Collapse(const CollapseCandidate& candidate,
   VertexState& kept = (*vertices)[candidate.first];
   VertexState& removed = (*vertices)[candidate.second];
   kept.point.xyz = candidate.position;
-  const Eigen::Vector3f combined_normal =
-      kept.point.normal + removed.point.normal;
-  kept.point.normal = combined_normal.squaredNorm() > 0.0F
-                          ? combined_normal.normalized()
-                          : Eigen::Vector3f::Zero();
-  for (int channel = 0; channel < 3; ++channel) {
-    kept.point.color[channel] = static_cast<std::uint8_t>(
-        (static_cast<unsigned int>(kept.point.color[channel]) +
-         static_cast<unsigned int>(removed.point.color[channel])) /
-        2U);
-  }
+  kept.color = candidate.color;
   kept.quadric += removed.quadric;
   ++kept.version;
   removed.active = false;
@@ -331,106 +332,145 @@ void RecomputeNormals(DenseTriangleMesh* mesh) {
 }  // namespace
 
 bool MeshSimplificationOptions::Check() const {
-  return std::isfinite(target_ratio) && target_ratio > 0.0 &&
-         target_ratio <= 1.0 && std::isfinite(max_error) && max_error >= 0.0 &&
-         std::isfinite(max_normal_change_degrees) &&
-         max_normal_change_degrees >= 0.0 &&
-         max_normal_change_degrees <= 180.0;
+  return std::isfinite(target_face_ratio) && target_face_ratio > 0.0 &&
+         target_face_ratio <= 1.0 && std::isfinite(max_error) && max_error >= 0.0 &&
+         std::isfinite(boundary_weight) && boundary_weight >= 0.0 &&
+         (num_threads == -1 || num_threads > 0);
 }
 
 DenseTriangleMesh SimplifyMesh(const DenseTriangleMesh& mesh,
                                const MeshSimplificationOptions& options) {
-  if (!options.Check()) {
-    throw std::invalid_argument("Invalid mesh simplification options.");
+  if (!options.Check()) throw std::invalid_argument("Invalid mesh simplification options.");
+  if (mesh.vertices.empty() || mesh.triangles.empty()) return mesh;
+  if (mesh.vertices.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+      mesh.triangles.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::invalid_argument("Mesh exceeds the supported index range");
   }
+  for (const auto& face : mesh.triangles) {
+    if (face.minCoeff() < 0 || face.maxCoeff() >= static_cast<int>(mesh.vertices.size())) {
+      throw std::invalid_argument("Mesh face index is outside the vertex array");
+    }
+  }
+  // A no-op ratio preserves vertex attributes and unreferenced vertices too.
+  if (options.target_face_ratio == 1.0) return mesh;
+  struct ThreadBudget {
+    int previous = parallel::getNumThreads();
+    explicit ThreadBudget(int count) { parallel::setNumThreads(count); }
+    ~ThreadBudget() { parallel::setNumThreads(previous); }
+  } budget(options.num_threads);
+
   std::vector<VertexState> vertices(mesh.vertices.size());
   for (std::size_t i = 0; i < mesh.vertices.size(); ++i) {
     vertices[i].point = mesh.vertices[i];
+    vertices[i].color = mesh.vertices[i].color.cast<float>();
   }
+  std::vector<Eigen::Matrix4d> face_quadrics(mesh.triangles.size(), Eigen::Matrix4d::Zero());
+  std::vector<std::uint8_t> valid(mesh.triangles.size(), 0);
+  parallel::parallel_for_(parallel::Range(0, static_cast<int>(mesh.triangles.size())),
+      [&](const parallel::Range& range) {
+    for (int i = range.start; i < range.end; ++i) {
+      const auto& face = mesh.triangles[i];
+      if (face.x() == face.y() || face.y() == face.z() || face.z() == face.x()) continue;
+      const auto& a = mesh.vertices[face.x()].xyz;
+      Eigen::Vector3d normal = (mesh.vertices[face.y()].xyz - a).cross(mesh.vertices[face.z()].xyz - a);
+      if (!normal.allFinite() || normal.squaredNorm() <= kMinAreaSquared) continue;
+      normal.normalize();
+      const Eigen::Vector4d plane(normal.x(), normal.y(), normal.z(), -normal.dot(a));
+      face_quadrics[i] = plane * plane.transpose();
+      valid[i] = 1;
+    }
+  });
   std::vector<FaceState> faces;
   faces.reserve(mesh.triangles.size());
-  for (const Eigen::Vector3i& triangle : mesh.triangles) {
-    if (triangle.minCoeff() < 0 ||
-        triangle.maxCoeff() >= static_cast<int>(vertices.size()) ||
-        triangle.x() == triangle.y() || triangle.y() == triangle.z() ||
-        triangle.z() == triangle.x()) {
-      continue;
-    }
-    const Eigen::Vector3d& first = vertices[triangle.x()].point.xyz;
-    const Eigen::Vector3d& second = vertices[triangle.y()].point.xyz;
-    const Eigen::Vector3d& third = vertices[triangle.z()].point.xyz;
-    Eigen::Vector3d normal = (second - first).cross(third - first);
-    if (normal.squaredNorm() <= kMinAreaSquared) {
-      continue;
-    }
-    normal.normalize();
-    const Eigen::Vector4d plane(normal.x(), normal.y(), normal.z(),
-                                -normal.dot(first));
-    const Eigen::Matrix4d quadric = plane * plane.transpose();
+  // Reduce in input order, independently of the initialization thread budget.
+  for (std::size_t i = 0; i < mesh.triangles.size(); ++i) {
+    if (!valid[i]) continue;
+    const auto& face = mesh.triangles[i];
     const int face_id = static_cast<int>(faces.size());
-    faces.push_back({{triangle.x(), triangle.y(), triangle.z()}, true});
+    faces.push_back({{face.x(), face.y(), face.z()}, true});
     for (int corner = 0; corner < 3; ++corner) {
-      vertices[triangle[corner]].quadric += quadric;
-      vertices[triangle[corner]].faces.push_back(face_id);
+      vertices[face[corner]].quadric += face_quadrics[i];
+      vertices[face[corner]].faces.push_back(face_id);
     }
   }
-
-  const std::size_t initial_faces = faces.size();
-  const std::size_t target_faces = std::min(
-      initial_faces,
-      options.target_num_triangles > 0
-          ? options.target_num_triangles
-          : static_cast<std::size_t>(std::floor(
-                static_cast<double>(initial_faces) * options.target_ratio)));
-  std::priority_queue<CollapseCandidate, std::vector<CollapseCandidate>,
-                      GreaterError>
-      queue;
-  std::set<std::array<int, 2>> initial_edges;
-  for (const FaceState& face : faces) {
-    for (int edge = 0; edge < 3; ++edge) {
-      initial_edges.insert(
-          OrderedEdge(face.vertices[edge], face.vertices[(edge + 1) % 3]));
+  face_quadrics.clear();
+  face_quadrics.shrink_to_fit();
+  struct EdgeInfo { int count = 0; int face = -1; };
+  std::map<std::array<int, 2>, EdgeInfo> edges;
+  for (std::size_t i = 0; i < faces.size(); ++i) {
+    const auto& face = faces[i];
+    for (int j = 0; j < 3; ++j) {
+      auto& info = edges[OrderedEdge(face.vertices[j], face.vertices[(j + 1) % 3])];
+      ++info.count;
+      info.face = static_cast<int>(i);
     }
   }
-  for (const auto& edge : initial_edges) {
-    queue.push(MakeCandidate(edge[0], edge[1], vertices));
+  if (options.boundary_weight > 0) {
+    for (const auto& [edge, info] : edges) {
+      if (info.count != 1) continue;
+      const auto& face = faces[info.face];
+      const auto& a = vertices[face.vertices[0]].point.xyz;
+      const Eigen::Vector3d normal = (vertices[face.vertices[1]].point.xyz - a).cross(
+          vertices[face.vertices[2]].point.xyz - a);
+      const auto& origin = vertices[edge[0]].point.xyz;
+      const Eigen::Vector3d direction = vertices[edge[1]].point.xyz - origin;
+      Eigen::Vector3d boundary_normal = direction.cross(normal);
+      if (boundary_normal.norm() < 1e-12) continue;
+      boundary_normal.normalize();
+      const Eigen::Vector4d plane(boundary_normal.x(), boundary_normal.y(), boundary_normal.z(), -boundary_normal.dot(origin));
+      const Eigen::Matrix4d quadric = options.boundary_weight * plane * plane.transpose();
+      vertices[edge[0]].quadric += quadric;
+      vertices[edge[1]].quadric += quadric;
+    }
   }
-
-  std::size_t active_faces = initial_faces;
+  std::vector<std::array<int, 2>> edge_ids;
+  edge_ids.reserve(edges.size());
+  for (const auto& [edge, info] : edges) edge_ids.push_back(edge);
+  if (edge_ids.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::invalid_argument("Mesh exceeds the supported edge range");
+  }
+  std::vector<CollapseCandidate> candidates(edge_ids.size());
+  parallel::parallel_for_(parallel::Range(0, static_cast<int>(edge_ids.size())), [&](const parallel::Range& range) {
+    for (int i = range.start; i < range.end; ++i) {
+      candidates[i] = MakeCandidate(edge_ids[i][0], edge_ids[i][1], vertices, options.interpolate_colors);
+    }
+  });
+  std::priority_queue<CollapseCandidate, std::vector<CollapseCandidate>, GreaterError> queue(
+      GreaterError{}, std::move(candidates));
+  const std::size_t target_faces = std::max<std::size_t>(1, static_cast<std::size_t>(
+      std::floor(static_cast<double>(mesh.triangles.size()) * options.target_face_ratio)));
+  std::size_t active_faces = faces.size();
   while (active_faces > target_faces && !queue.empty()) {
-    const CollapseCandidate candidate = queue.top();
+    const auto candidate = queue.top();
     queue.pop();
-    if (options.max_error > 0.0 && candidate.error > options.max_error) {
-      break;
-    }
-    if (!CanCollapse(candidate, options, vertices, faces)) {
-      continue;
-    }
+    if (!vertices[candidate.first].active || !vertices[candidate.second].active ||
+        candidate.first_version != vertices[candidate.first].version ||
+        candidate.second_version != vertices[candidate.second].version) continue;
+    if (options.max_error > 0 && candidate.error > options.max_error) break;
+    if (!CanCollapse(candidate, vertices, faces)) continue;
     active_faces -= Collapse(candidate, &vertices, &faces);
-    for (const int neighbor :
-         ActiveNeighbors(candidate.first, vertices, faces)) {
-      queue.push(MakeCandidate(candidate.first, neighbor, vertices));
+    for (const auto neighbor : ActiveNeighbors(candidate.first, vertices, faces)) {
+      queue.push(MakeCandidate(candidate.first, neighbor, vertices, options.interpolate_colors));
     }
   }
-
   DenseTriangleMesh result;
   std::vector<int> new_indices(vertices.size(), -1);
   std::set<std::array<int, 3>> unique_faces;
-  for (const FaceState& face : faces) {
-    if (!face.active) {
-      continue;
-    }
-    std::array<int, 3> canonical = face.vertices;
+  for (const auto& face : faces) {
+    if (!face.active) continue;
+    auto canonical = face.vertices;
     std::sort(canonical.begin(), canonical.end());
-    if (!unique_faces.insert(canonical).second) {
-      continue;
-    }
+    if (!unique_faces.insert(canonical).second) continue;
     Eigen::Vector3i triangle;
     for (int corner = 0; corner < 3; ++corner) {
       const int old_index = face.vertices[corner];
       if (new_indices[old_index] < 0) {
         new_indices[old_index] = static_cast<int>(result.vertices.size());
-        result.vertices.push_back(vertices[old_index].point);
+        auto point = vertices[old_index].point;
+        for (int channel = 0; channel < 3; ++channel) {
+          point.color[channel] = static_cast<std::uint8_t>(std::clamp(std::round(vertices[old_index].color[channel]), 0.0F, 255.0F));
+        }
+        result.vertices.push_back(point);
       }
       triangle[corner] = new_indices[old_index];
     }
@@ -441,7 +481,11 @@ DenseTriangleMesh SimplifyMesh(const DenseTriangleMesh& mesh,
 }
 
 DenseTriangleMesh ReadDenseTriangleMeshPly(
-    const std::filesystem::path& path) {
+    const std::filesystem::path& path,
+    std::vector<Eigen::Vector2f>* face_uvs,
+    std::string* texture_file) {
+  if (face_uvs) face_uvs->clear();
+  if (texture_file) texture_file->clear();
   std::ifstream file(path, std::ios::binary);
   if (!file) {
     throw std::runtime_error("Failed to read triangle mesh: " + path.string());
@@ -475,7 +519,14 @@ DenseTriangleMesh ReadDenseTriangleMeshPly(
     std::istringstream stream(line);
     std::string keyword;
     stream >> keyword;
-    if (keyword == "format") {
+    if (keyword == "comment") {
+      std::string label;
+      stream >> label;
+      if (label == "TextureFile" && texture_file) {
+        std::getline(stream >> std::ws, *texture_file);
+        if (!texture_file->empty() && texture_file->back() == '\r') texture_file->pop_back();
+      }
+    } else if (keyword == "format") {
       std::string format;
       stream >> format;
       ascii = format == "ascii";
@@ -604,6 +655,7 @@ DenseTriangleMesh ReadDenseTriangleMeshPly(
       stream.str(line);
     }
     std::vector<int> indices;
+    std::vector<Eigen::Vector2f> uvs;
     for (const Property& property : face_properties) {
       if (!property.list) {
         double ignored = 0.0;
@@ -615,18 +667,38 @@ DenseTriangleMesh ReadDenseTriangleMeshPly(
       std::size_t count = 0;
       if (ascii) stream >> count;
       else count = static_cast<std::size_t>(read_binary(property.count_type));
-      std::vector<int> values(count);
-      for (int& value : values) {
-        if (ascii) stream >> value;
-        else value = static_cast<int>(read_binary(property.value_type));
+      const bool is_indices = property.name == "vertex_indices" || property.name == "vertex_index";
+      const bool is_uv = property.name == "texcoord";
+      if ((is_indices && count != 3) || (is_uv && count != 6) ||
+          count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("Invalid PLY face list length");
       }
-      if ((property.name == "vertex_indices" ||
-           property.name == "vertex_index") && indices.empty()) {
-        indices = std::move(values);
+      std::vector<double> values(count);
+      for (double& value : values) {
+        if (ascii) stream >> value;
+        else value = read_binary(property.value_type);
+        if (!std::isfinite(value) || (ascii && !stream)) throw std::runtime_error("Invalid PLY face value");
+      }
+      if (is_indices) {
+        for (const auto value : values) {
+          if (value < 0 || value >= num_vertices || value > std::numeric_limits<int>::max() || std::floor(value) != value) {
+            throw std::runtime_error("Invalid PLY vertex index");
+          }
+          indices.push_back(static_cast<int>(value));
+        }
+      } else if (is_uv) {
+        for (int corner = 0; corner < 3; ++corner) {
+          const Eigen::Vector2f uv(static_cast<float>(values[corner * 2]), static_cast<float>(values[corner * 2 + 1]));
+          if (!uv.allFinite()) throw std::runtime_error("Invalid PLY texture coordinate");
+          uvs.push_back(uv);
+        }
       }
     }
     if (indices.size() == 3 && (!ascii || stream)) {
       mesh.triangles.emplace_back(indices[0], indices[1], indices[2]);
+      if (face_uvs) face_uvs->insert(face_uvs->end(), uvs.begin(), uvs.end());
+    } else {
+      throw std::runtime_error("Invalid triangular PLY face");
     }
   }
   return mesh;

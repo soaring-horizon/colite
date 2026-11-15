@@ -69,6 +69,9 @@ bool ObservationManager::AddObservation(Point3DId point3d_id,
 
   Point3D& point3d = reconstruction_->GetPoint3D(point3d_id);
   if (TrackHasObservation(point3d.track, image_id, point2d_idx)) {
+    if (point2d.point3d_id != point3d_id) {
+      reconstruction_->MarkPoint3DChanged(point3d_id);
+    }
     point2d.point3d_id = point3d_id;
     return false;
   }
@@ -78,6 +81,7 @@ bool ObservationManager::AddObservation(Point3DId point3d_id,
 
   point2d.point3d_id = point3d_id;
   point3d.track.AddElement(image_id, point2d_idx);
+  reconstruction_->MarkPoint3DChanged(point3d_id);
   return true;
 }
 
@@ -160,6 +164,7 @@ bool ObservationManager::MergePoints(Point3DId target_point3d_id,
 
   Point3D& merged_point3d = reconstruction_->GetPoint3D(target_point3d_id);
   merged_point3d.xyz = merged_xyz;
+  reconstruction_->MarkPoint3DChanged(target_point3d_id);
   for (const auto& [image_id, candidate] : selected) {
     (void)image_id;
     if (!candidate.from_target &&

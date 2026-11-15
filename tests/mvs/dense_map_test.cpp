@@ -59,6 +59,56 @@ TEST(DenseDepthMapTest, MutableDataUpdatesDepthValues) {
   EXPECT_EQ(depth_map.ValidPixelCount(), 1U);
 }
 
+TEST(DenseMapIoTest, WritesColmapHeadersAndPlanarNormalChannels) {
+  const auto root = std::filesystem::temp_directory_path() / "colite_dense_colmap_writer_test";
+  std::filesystem::remove_all(root);
+  DenseDepthMap depth(2, 1); depth.Set(0, 0, 3); depth.Set(0, 1, 5);
+  NormalMap normal(2, 1);
+  normal.Set(0, 0, Eigen::Vector3f(0.6F, 0, -0.8F));
+  normal.Set(0, 1, Eigen::Vector3f(0, 0.8F, -0.6F));
+  WriteDenseDepthMapColmapBinary(root / "depth.bin", depth);
+  WriteNormalMapColmapBinary(root / "normal.bin", normal);
+  EXPECT_EQ(ReadTextFile(root / "depth.bin").substr(0, 6), "2&1&1&");
+  std::ifstream file(root / "normal.bin", std::ios::binary);
+  file.seekg(6);
+  float data[6]{}; file.read(reinterpret_cast<char*>(data), sizeof(data));
+  const float expected[] = {0.6F, 0, 0, 0.8F, -0.8F, -0.6F};
+  for (int i = 0; i < 6; ++i) EXPECT_FLOAT_EQ(data[i], expected[i]);
+  file.close();
+  const auto loaded = ReadNormalMapBinary(root / "normal.bin");
+  EXPECT_TRUE(loaded.Get(0, 0).isApprox(normal.Get(0, 0)));
+  EXPECT_TRUE(loaded.Get(0, 1).isApprox(normal.Get(0, 1)));
+  EXPECT_EQ(ReadDenseDepthMapSize(root / "depth.bin", true), std::make_pair(std::size_t{2}, std::size_t{1}));
+  std::filesystem::resize_file(root / "depth.bin", 7);
+  EXPECT_THROW(ReadDenseDepthMapSize(root / "depth.bin", true), std::runtime_error);
+  std::filesystem::remove_all(root);
+}
+
+TEST(DenseDepthMapTest, DownsizePreservesZAndNormalDirectionAndNeverUpsamples) {
+  DenseDepthMap depth(4, 4); depth.Fill(3);
+  NormalMap normal(4, 4); normal.Fill(Eigen::Vector3f(0.6F, 0, -0.8F));
+  DownsizeDepthNormalMaps(2, 2, &depth, &normal);
+  ASSERT_EQ(depth.Width(), 2); ASSERT_EQ(normal.Height(), 2);
+  for (std::size_t r = 0; r < 2; ++r) for (std::size_t c = 0; c < 2; ++c) {
+    EXPECT_NEAR(depth.Get(r, c), 3, 1e-6);
+    EXPECT_TRUE(normal.Get(r, c).isApprox(Eigen::Vector3f(0.6F, 0, -0.8F), 1e-6F));
+  }
+  DownsizeDepthNormalMaps(16, 16, &depth, &normal);
+  EXPECT_EQ(depth.Width(), 2);
+  EXPECT_EQ(DenseMapDownsizeShape(7, 5, 4, 4), std::make_pair(std::size_t{4}, std::size_t{3}));
+  EXPECT_THROW(DownsizeDepthNormalMaps(0, 0, &depth, &normal), std::invalid_argument);
+}
+
+TEST(DenseDepthMapTest, DownsizeUsesPrefilteredPixelCenters) {
+  DenseDepthMap depth(4, 4);
+  NormalMap normal(4, 4); normal.Fill(Eigen::Vector3f(0, 0, -1));
+  for (std::size_t r = 0; r < 4; ++r) for (std::size_t c = 0; c < 4; ++c) depth.Set(r, c, 1 + r * 4 + c);
+  DownsizeDepthNormalMaps(2, 2, &depth, &normal);
+  // COLMAP 4.0's independent image downsampling fixture, shifted by +1 Z.
+  const float expected[] = {3.76810598F, 5.66086388F, 11.3391361F, 13.2318935F};
+  for (std::size_t i = 0; i < 4; ++i) EXPECT_NEAR(depth.Data()[i], expected[i], 1e-3);
+}
+
 TEST(NormalMapTest, StoresNormalizedNormalsAndValidity) {
   NormalMap normal_map(2, 2);
 

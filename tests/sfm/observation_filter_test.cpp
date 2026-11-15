@@ -1,6 +1,7 @@
 #include "colite/sfm/observation_filter.h"
 
 #include <string>
+#include <limits>
 
 #include <gtest/gtest.h>
 
@@ -45,6 +46,104 @@ void AddProjectedObservation(const Camera& camera,
   image->points2d.push_back(
       {*pixel, static_cast<Point2DIdx>(image->points2d.size()),
        kInvalidPoint3DId});
+}
+
+TEST(ObservationFilterTest,
+     NegativeDepthCleanupPreservesPositiveAndUnregisteredObservations) {
+  Reconstruction model;
+  model.AddCamera(MakeCamera());
+  for (ImageId id = 1; id <= 4; ++id) {
+    auto image = MakeRegisteredImage(id, CameraAt(
+        Eigen::Vector3d(0, 0, id == 3 ? 6 : 0)));
+    image.registered = id != 4;
+    for (Point2DIdx idx = 0; idx < 7; ++idx)
+      image.points2d.push_back({Eigen::Vector2d(-100, -200), idx, kInvalidPoint3DId});
+    model.AddImage(image);
+  }
+  const auto add = [&](const double z, const Point2DIdx idx,
+                       const std::vector<ImageId>& images) {
+    Track track;
+    for (const auto id : images) track.AddElement(id, idx);
+    return model.AddPoint3D(Eigen::Vector3d(0, 0, z), track);
+  };
+  const double epsilon = std::numeric_limits<double>::epsilon();
+  const auto partial = add(4, 0, {1, 2, 3});
+  const auto short_track = add(4, 1, {1, 3});
+  const auto positive = add(8, 2, {1, 2, 3});
+  const auto zero = add(0, 3, {1, 2});
+  const auto boundary = add(epsilon, 4, {1, 2});
+  const auto unregistered = add(-1, 5, {4});
+  const auto sub_epsilon = add(epsilon / 2, 6, {1, 2});
+  const auto summary = FilterObservationsWithNegativeDepth(&model);
+  ASSERT_TRUE(summary.success);
+  EXPECT_EQ(summary.num_filtered_observations, 4U);
+  EXPECT_EQ(summary.num_removed_points, 3U);
+  EXPECT_EQ(summary.num_remaining_observations, 7U);
+  EXPECT_EQ(model.Points3D().size(), 4U);
+  EXPECT_EQ(model.GetPoint3D(partial).track.Length(), 2U);
+  EXPECT_EQ(model.GetPoint3D(positive).track.Length(), 3U);
+  EXPECT_DOUBLE_EQ(model.GetPoint3D(boundary).xyz.z(), epsilon);
+  EXPECT_DOUBLE_EQ(model.GetPoint3D(unregistered).xyz.z(), -1);
+  for (const auto id : {short_track, zero, sub_epsilon})
+    EXPECT_FALSE(model.ExistsPoint3D(id));
+  EXPECT_FALSE(model.GetImage(1).points2d[1].HasPoint3D());
+  EXPECT_FALSE(model.GetImage(3).points2d[0].HasPoint3D());
+  for (const auto& [id, point] : model.Points3D()) {
+    for (const auto& link : point.track.elements)
+      EXPECT_EQ(model.GetImage(link.image_id).points2d[link.point2d_idx].point3d_id, id);
+  }
+  const auto repeat = FilterObservationsWithNegativeDepth(&model);
+  EXPECT_TRUE(repeat.success);
+  EXPECT_EQ(repeat.num_filtered_observations, 0U);
+  EXPECT_EQ(repeat.num_removed_points, 0U);
+  EXPECT_EQ(repeat.num_remaining_observations, 7U);
+  EXPECT_FALSE(FilterObservationsWithNegativeDepth(nullptr).success);
+}
+
+TEST(ObservationFilterTest, PixelNoiseDoesNotInventParallaxForCoincidentCameras) {
+  const auto camera = MakeCamera();
+  Reconstruction model; model.AddCamera(camera);
+  const Eigen::Vector3d point(0,0,4);
+  for (ImageId id : {1,2}) {
+    auto image = MakeRegisteredImage(id, CameraAt({0,0,0}));
+    AddProjectedObservation(camera, *image.cam_from_world, point, &image);
+    image.points2d[0].xy.x() += id == 1 ? 20 : -20;
+    model.AddImage(image);
+  }
+  Track track; track.AddElement(1,0); track.AddElement(2,0);
+  const auto id = model.AddPoint3D(point, track);
+  ObservationFilterOptions options;
+  options.max_reprojection_error_px = 25;
+  options.min_triangulation_angle_deg = 1.5;
+  const auto summary = FilterObservationsAndPoints(options, &model);
+  ASSERT_TRUE(summary.success);
+  EXPECT_EQ(summary.num_reprojection_observations, 0U);
+  EXPECT_EQ(summary.num_low_angle_points, 1U);
+  EXPECT_FALSE(model.ExistsPoint3D(id));
+}
+
+TEST(ObservationFilterTest, GeometricParallaxDoesNotRequireInverseCameraRay) {
+  auto camera = MakeCamera();
+  camera.model_id = CameraModelId::kSimpleRadial;
+  camera.params = {700,500,400,-1};
+  Reconstruction model; model.AddCamera(camera);
+  const Eigen::Vector3d point(1.2,0,1);
+  for (ImageId id : {1,2}) {
+    auto image = MakeRegisteredImage(id, CameraAt({.1*(id-1),0,0}));
+    AddProjectedObservation(camera, *image.cam_from_world, point, &image);
+    model.AddImage(image);
+  }
+  ASSERT_FALSE(TryPixelToBearing(camera, model.GetImage(1).points2d[0].xy));
+  Track track; track.AddElement(1,0); track.AddElement(2,0);
+  const auto id = model.AddPoint3D(point, track);
+  ObservationFilterOptions options;
+  options.max_reprojection_error_px = 1e-6;
+  options.min_triangulation_angle_deg = 1;
+  const auto summary = FilterObservationsAndPoints(options, &model);
+  ASSERT_TRUE(summary.success);
+  EXPECT_EQ(summary.num_removed_points, 0U);
+  ASSERT_TRUE(model.ExistsPoint3D(id));
+  EXPECT_EQ(model.GetPoint3D(id).track.Length(), 2U);
 }
 
 TEST(ObservationFilterTest,
@@ -153,6 +252,15 @@ TEST(ObservationFilterTest, FiltersOnlyPointsObservedBySelectedImages) {
   EXPECT_FALSE(reconstruction.ExistsPoint3D(point_a_id));
   EXPECT_TRUE(reconstruction.ExistsPoint3D(point_b_id));
   EXPECT_TRUE(reconstruction.GetImage(4).points2d[0].HasPoint3D());
+
+  // A changed point outside the local images must also be filtered; deleted
+  // IDs in the change collection are harmless and are not counted twice.
+  const std::set<Point3DId> changed = {point_a_id, point_b_id};
+  const auto changed_summary = FilterObservationsAndPointsInImages(
+      options, {1, 2}, &reconstruction, &changed);
+  EXPECT_EQ(changed_summary.num_removed_observations, 1U);
+  EXPECT_EQ(changed_summary.num_removed_points, 1U);
+  EXPECT_FALSE(reconstruction.ExistsPoint3D(point_b_id));
 }
 
 }  // namespace

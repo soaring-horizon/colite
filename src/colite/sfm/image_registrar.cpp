@@ -8,27 +8,31 @@
 #include <optional>
 #include <random>
 #include <vector>
+#include <memory>
+
+#include <ceres/ceres.h>
+#include <glog/logging.h>
 
 #include <Eigen/Geometry>
-#include <Eigen/SVD>
 
 #include "colite/core/geometry.h"
+#include "colite/core/ransac.h"
+#include "colmap/epnp.h"
+#include "ceres_manifold_compat.h"
+#include "reprojection_cost.h"
 #include "colite/sfm/observation_manager.h"
 
 #ifdef COLITE_HAS_POSELIB
 #include <PoseLib/solvers/p3p.h>
+#else
+#include "poselib/p3p.h"
 #endif
 
 namespace colite {
 namespace {
 
-constexpr std::size_t kMinDltPnPPoints = 6;
-#ifdef COLITE_HAS_POSELIB
+constexpr std::size_t kMinEpnpPoints = 4;
 constexpr std::size_t kMinPnPPoints = 3;
-#else
-constexpr std::size_t kMinPnPPoints = kMinDltPnPPoints;
-#endif
-constexpr double kMinProjectionScale = 1e-12;
 
 struct PnPCorrespondence {
   Point3DId point3d_id = kInvalidPoint3DId;
@@ -59,9 +63,7 @@ ImageId OtherImageId(const ImagePair& pair, ImageId image_id) {
 }
 
 bool IsUsableGeometry(const TwoViewGeometry& geometry) {
-  return geometry.type != TwoViewGeometry::Type::kUndefined &&
-         geometry.type != TwoViewGeometry::Type::kDegenerate &&
-         !geometry.inlier_matches.empty();
+  return geometry.HasUsableCorrespondences();
 }
 
 void AddCorrespondenceIfValid(const FeatureMatch& match,
@@ -140,6 +142,8 @@ std::vector<PnPCorrespondence> CollectPnPCorrespondences(
   correspondences.reserve(unique_correspondences.size());
   for (const auto& [target_idx, correspondence] : unique_correspondences) {
     (void)target_idx;
+    if (!TryUnprojectPixel(reconstruction->GetCamera(target_image.camera_id),
+                           correspondence.xy, 1.0)) continue;
     correspondences.push_back(correspondence);
   }
   return correspondences;
@@ -166,116 +170,62 @@ Eigen::Vector2d NormalizedImagePoint(const Camera& camera,
   return {ray.x() / ray.z(), ray.y() / ray.z()};
 }
 
-std::optional<Pose3> PoseFromProjectionMatrix(
-    Eigen::Matrix<double, 3, 4> projection,
-    const std::vector<PnPCorrespondence>& correspondences,
-    const std::vector<std::size_t>& indices) {
-  Pose3 best_pose;
-  std::size_t best_positive_depths = 0;
-
-  for (const double sign : {1.0, -1.0}) {
-    const Eigen::Matrix<double, 3, 4> signed_projection = sign * projection;
-    const Eigen::Matrix3d m = signed_projection.leftCols<3>();
-    const Eigen::JacobiSVD<Eigen::Matrix3d> svd(
-        m, Eigen::ComputeFullU | Eigen::ComputeFullV);
-    Eigen::Matrix3d rotation = svd.matrixU() * svd.matrixV().transpose();
-    if (rotation.determinant() < 0.0) {
-      continue;
-    }
-
-    const double scale = svd.singularValues().mean();
-    if (scale <= 0.0 || !std::isfinite(scale)) {
-      continue;
-    }
-
-    Pose3 pose;
-    pose.q_cw = Eigen::Quaterniond(rotation).normalized();
-    pose.t_cw = signed_projection.col(3) / scale;
-
-    std::size_t positive_depths = 0;
-    for (const std::size_t idx : indices) {
-      if (pose.TransformPoint(correspondences[idx].xyz).z() > 0.0) {
-        ++positive_depths;
-      }
-    }
-
-    if (positive_depths > best_positive_depths) {
-      best_positive_depths = positive_depths;
-      best_pose = pose;
-    }
-  }
-
-  if (best_positive_depths == 0) {
-    return std::nullopt;
-  }
-  return best_pose;
-}
-
-std::optional<Pose3> EstimatePoseDlt(
-    const Camera& camera,
-    const std::vector<PnPCorrespondence>& correspondences,
-    const std::vector<std::size_t>& indices) {
-  if (indices.size() < kMinDltPnPPoints) {
-    return std::nullopt;
-  }
-
-  Eigen::MatrixXd a(static_cast<Eigen::Index>(2 * indices.size()), 12);
-  for (std::size_t row = 0; row < indices.size(); ++row) {
-    const PnPCorrespondence& correspondence = correspondences[indices[row]];
-    const Eigen::Vector2d xy =
-        NormalizedImagePoint(camera, correspondence.xy);
-    const Eigen::Vector4d xyz_h = correspondence.xyz.homogeneous();
-
-    a.row(static_cast<Eigen::Index>(2 * row)).setZero();
-    a.row(static_cast<Eigen::Index>(2 * row)).segment<4>(4) = -xyz_h;
-    a.row(static_cast<Eigen::Index>(2 * row)).segment<4>(8) = xy.y() * xyz_h;
-
-    a.row(static_cast<Eigen::Index>(2 * row + 1)).setZero();
-    a.row(static_cast<Eigen::Index>(2 * row + 1)).segment<4>(0) = xyz_h;
-    a.row(static_cast<Eigen::Index>(2 * row + 1)).segment<4>(8) =
-        -xy.x() * xyz_h;
-  }
-
-  const Eigen::JacobiSVD<Eigen::MatrixXd> svd(a, Eigen::ComputeFullV);
-  Eigen::Matrix<double, 3, 4> projection =
-      Eigen::Map<const Eigen::Matrix<double, 3, 4, Eigen::RowMajor>>(
-          svd.matrixV().col(11).data());
-  if (projection.leftCols<3>().norm() <= kMinProjectionScale) {
-    return std::nullopt;
-  }
-  return PoseFromProjectionMatrix(projection, correspondences, indices);
-}
-
 std::vector<std::size_t> InliersForPose(
     const Camera& camera,
     const std::vector<PnPCorrespondence>& correspondences,
     const Pose3& pose,
-    const double max_reprojection_error_px) {
+    const double max_reprojection_error_px,
+    double* inlier_squared_error) {
   std::vector<std::size_t> inliers;
   inliers.reserve(correspondences.size());
+  *inlier_squared_error = 0;
   for (std::size_t idx = 0; idx < correspondences.size(); ++idx) {
     const std::optional<double> error =
         ReprojectionError(camera, pose, correspondences[idx].xyz,
                           correspondences[idx].xy);
     if (error && *error <= max_reprojection_error_px) {
       inliers.push_back(idx);
+      *inlier_squared_error += *error * *error;
     }
   }
   return inliers;
+}
+
+std::optional<Pose3> EstimatePoseEpnp(
+    const Camera& camera,
+    const std::vector<PnPCorrespondence>& correspondences,
+    const std::vector<std::size_t>& indices) {
+  std::vector<Eigen::Vector2d> pixels;
+  std::vector<Eigen::Vector3d> points;
+  pixels.reserve(indices.size());
+  points.reserve(indices.size());
+  for (const auto index : indices) {
+    pixels.push_back(correspondences[index].xy);
+    points.push_back(correspondences[index].xyz);
+  }
+  return EstimateAbsolutePoseEpnp(camera, pixels, points);
 }
 
 struct PnPRansacResult {
   Pose3 pose;
   std::vector<std::size_t> inlier_indices;
   std::size_t num_inliers_before_final_refinement = 0;
+  std::size_t num_iterations = 0;
+  double inlier_squared_error = std::numeric_limits<double>::infinity();
 };
+
+bool BetterSupport(std::size_t count, double squared_error,
+                   const PnPRansacResult& best) {
+  return count > best.inlier_indices.size() ||
+         (count == best.inlier_indices.size() &&
+          squared_error < best.inlier_squared_error);
+}
 
 std::vector<Pose3> EstimateMinimalPoses(
     const Camera& camera,
     const std::vector<PnPCorrespondence>& correspondences,
     const std::vector<std::size_t>& indices) {
   std::vector<Pose3> poses;
-#ifdef COLITE_HAS_POSELIB
   if (indices.size() != 3) {
     return poses;
   }
@@ -290,23 +240,21 @@ std::vector<Pose3> EstimateMinimalPoses(
             .normalized());
     points3d.push_back(correspondences[idx].xyz);
   }
-  std::vector<poselib::CameraPose> solutions;
-  poselib::p3p(rays, points3d, &solutions);
+#ifdef COLITE_HAS_POSELIB
+  namespace solver = poselib;
+#else
+  namespace solver = third_party::poselib;
+#endif
+  std::vector<solver::CameraPose> solutions;
+  solver::p3p(rays, points3d, &solutions);
   poses.reserve(solutions.size());
-  for (const poselib::CameraPose& solution : solutions) {
+  for (const solver::CameraPose& solution : solutions) {
     const Eigen::Matrix<double, 3, 4> matrix = solution.Rt();
     Pose3 pose;
     pose.q_cw = Eigen::Quaterniond(matrix.leftCols<3>()).normalized();
     pose.t_cw = matrix.col(3);
     poses.push_back(pose);
   }
-#else
-  const std::optional<Pose3> pose =
-      EstimatePoseDlt(camera, correspondences, indices);
-  if (pose) {
-    poses.push_back(*pose);
-  }
-#endif
   return poses;
 }
 
@@ -319,12 +267,19 @@ PnPRansacResult EstimatePoseRansac(
     return best;
   }
 
-  std::mt19937 rng(0);
+  std::mt19937 rng(options.random_seed < 0 ? std::random_device{}()
+                                         : static_cast<unsigned>(options.random_seed));
   const int min_iterations = std::max(1, options.min_num_iterations);
-  const int max_iterations =
-      std::max(min_iterations, options.max_num_iterations);
+  // Use the same prior and finite-population stopping rule as two-view
+  // RANSAC. A perfect hypothesis must still satisfy the minimum trial budget.
+  const int max_iterations = std::clamp(
+      RansacTrials(static_cast<std::size_t>(options.min_inlier_ratio * 100000),
+                   100000, kMinPnPPoints, options.confidence,
+                   std::max(min_iterations, options.max_num_iterations)),
+      min_iterations, std::max(min_iterations, options.max_num_iterations));
   int required_iterations = max_iterations;
   for (int iteration = 0; iteration < required_iterations; ++iteration) {
+    best.num_iterations = static_cast<std::size_t>(iteration + 1);
     const std::vector<std::size_t> sample =
         correspondences.size() == kMinPnPPoints
             ? AllIndices(correspondences.size())
@@ -332,70 +287,49 @@ PnPRansacResult EstimatePoseRansac(
                                   kMinPnPPoints);
     for (const Pose3& pose :
          EstimateMinimalPoses(camera, correspondences, sample)) {
+      double squared_error;
       std::vector<std::size_t> inliers = InliersForPose(
-          camera, correspondences, pose, options.max_reprojection_error_px);
-      if (inliers.size() > best.inlier_indices.size()) {
+          camera, correspondences, pose, options.max_reprojection_error_px,
+          &squared_error);
+      if (BetterSupport(inliers.size(), squared_error, best)) {
         best.pose = pose;
         best.inlier_indices = std::move(inliers);
+        best.inlier_squared_error = squared_error;
 
-        // Local optimization uses all current inliers. The Eigen DLT solver
-        // is non-minimal here and keeps builds without PoseLib functional.
-        if (best.inlier_indices.size() >= kMinDltPnPPoints) {
+        // As in COLMAP's LO-RANSAC, EPnP fits all current inliers and can
+        // expand support recursively; a tied support must lower pixel error.
+        for (int local_trial = 0;
+             local_trial < 10 &&
+             best.inlier_indices.size() >= kMinEpnpPoints;
+             ++local_trial) {
+          const auto previous_count = best.inlier_indices.size();
           const std::optional<Pose3> local =
-              EstimatePoseDlt(camera, correspondences, best.inlier_indices);
+              EstimatePoseEpnp(camera, correspondences, best.inlier_indices);
           if (local) {
+            double local_error;
             std::vector<std::size_t> local_inliers = InliersForPose(
                 camera, correspondences, *local,
-                options.max_reprojection_error_px);
-            if (local_inliers.size() >= best.inlier_indices.size()) {
+                options.max_reprojection_error_px, &local_error);
+            if (BetterSupport(local_inliers.size(), local_error, best)) {
               best.pose = *local;
               best.inlier_indices = std::move(local_inliers);
+              best.inlier_squared_error = local_error;
             }
           }
+          if (best.inlier_indices.size() <= previous_count) break;
         }
 
-        if (best.inlier_indices.size() == correspondences.size()) {
-          best.num_inliers_before_final_refinement =
-              best.inlier_indices.size();
-          return best;
-        }
-        const double ratio =
-            static_cast<double>(best.inlier_indices.size()) /
-            correspondences.size();
-        const double sample_success =
-            std::pow(ratio, static_cast<double>(kMinPnPPoints));
-        if (sample_success > 0.0 && sample_success < 1.0) {
-          const double confidence =
-              std::clamp(options.confidence, 0.0, 1.0 - 1e-12);
-          const double estimate = std::log(1.0 - confidence) /
-                                  std::log(1.0 - sample_success);
-          if (std::isfinite(estimate)) {
-            required_iterations = std::clamp(
-                static_cast<int>(std::ceil(estimate)), min_iterations,
-                max_iterations);
-            required_iterations =
-                std::max(required_iterations, iteration + 1);
-          }
-        }
+        required_iterations = std::max(
+            iteration + 1,
+            std::clamp(RansacTrials(best.inlier_indices.size(),
+                                   correspondences.size(), kMinPnPPoints,
+                                   options.confidence, max_iterations),
+                       min_iterations, max_iterations));
       }
     }
   }
 
   best.num_inliers_before_final_refinement = best.inlier_indices.size();
-  if (best.inlier_indices.size() >= kMinDltPnPPoints) {
-    const std::optional<Pose3> refined =
-        EstimatePoseDlt(camera, correspondences, best.inlier_indices);
-    if (refined) {
-      std::vector<std::size_t> refined_inliers =
-          InliersForPose(camera, correspondences, *refined,
-                         options.max_reprojection_error_px);
-      if (refined_inliers.size() >= best.inlier_indices.size()) {
-        best.pose = *refined;
-        best.inlier_indices = std::move(refined_inliers);
-      }
-    }
-  }
-
   return best;
 }
 
@@ -440,6 +374,109 @@ void LinkInlierCorrespondencesToImage(
 
 }  // namespace
 
+std::optional<Pose3> EstimateAbsolutePoseEpnp(
+    const Camera& camera, const std::vector<Eigen::Vector2d>& points2d,
+    const std::vector<Eigen::Vector3d>& points3d) {
+  if (points2d.size() < kMinEpnpPoints || points2d.size() != points3d.size() ||
+      !camera.VerifyParams()) return std::nullopt;
+  std::vector<third_party::colmap::Point2DWithRay> observations;
+  observations.reserve(points2d.size());
+  for (std::size_t i = 0; i < points2d.size(); ++i) {
+    if (!points2d[i].allFinite() || !points3d[i].allFinite()) return std::nullopt;
+    const auto ray = TryPixelToBearing(camera, points2d[i]);
+    if (!ray) return std::nullopt;
+    observations.push_back({points2d[i], *ray});
+  }
+  third_party::colmap::EPNPEstimator estimator(
+      [&camera](const Eigen::Vector3d& point) {
+        return ProjectWorldPoint(camera, Pose3{}, point);
+      });
+  std::vector<third_party::colmap::Matrix3x4d> models;
+  estimator.Estimate(observations, points3d, &models);
+  if (models.empty() || !models[0].allFinite()) return std::nullopt;
+  Pose3 pose;
+  pose.q_cw = Eigen::Quaterniond(models[0].leftCols<3>()).normalized();
+  pose.t_cw = models[0].col(3);
+  if (!pose.q_cw.coeffs().allFinite()) return std::nullopt;
+  return pose;
+}
+
+AbsolutePoseRefinementSummary RefineAbsolutePose(
+    const AbsolutePoseRefinementOptions& options, const Camera& camera,
+    const std::vector<Eigen::Vector2d>& points2d,
+    const std::vector<Eigen::Vector3d>& points3d,
+    const std::vector<char>& inlier_mask, Pose3* pose) {
+  AbsolutePoseRefinementSummary summary;
+  if (pose == nullptr || points2d.size() != points3d.size() ||
+      points2d.size() != inlier_mask.size() || !camera.VerifyParams() ||
+      options.max_num_iterations < 0 || !std::isfinite(options.gradient_tolerance) ||
+      options.gradient_tolerance < 0 || !std::isfinite(options.loss_function_scale) ||
+      options.loss_function_scale <= 0) {
+    summary.message = "Invalid absolute pose refinement inputs; pose unchanged";
+    return summary;
+  }
+  if (!pose->q_cw.coeffs().allFinite() || !pose->t_cw.allFinite() ||
+      !std::isfinite(pose->q_cw.norm()) || pose->q_cw.norm() <= 0) {
+    summary.message = "Invalid initial absolute pose; pose unchanged";
+    return summary;
+  }
+  for (std::size_t i = 0; i < inlier_mask.size(); ++i) {
+    if (!inlier_mask[i]) continue;
+    if (!points2d[i].allFinite() || !points3d[i].allFinite()) {
+      summary.message = "Non-finite absolute pose inlier; pose unchanged";
+      return summary;
+    }
+    ++summary.num_observations;
+  }
+  if (summary.num_observations == 0) {
+    summary.message = "Absolute pose refinement has no inliers; pose unchanged";
+    return summary;
+  }
+  Eigen::Quaterniond q = pose->q_cw.normalized();
+  Eigen::Vector3d translation = pose->t_cw;
+  auto fixed_points = points3d;
+  auto fixed_camera = camera.params;
+  auto loss = std::make_unique<ceres::CauchyLoss>(options.loss_function_scale);
+  ceres::Problem::Options problem_options;
+  problem_options.loss_function_ownership = ceres::DO_NOT_TAKE_OWNERSHIP;
+  ceres::Problem problem(problem_options);
+  ceres_compat::AddEigenQuaternionParameterBlock(&problem, q.coeffs().data());
+  problem.AddParameterBlock(translation.data(), 3);
+  for (std::size_t i = 0; i < inlier_mask.size(); ++i) {
+    if (!inlier_mask[i]) continue;
+    problem.AddResidualBlock(bundle_internal::CreateReprojectionCost(
+        camera.model_id, fixed_camera.size(), points2d[i]), loss.get(),
+        q.coeffs().data(), translation.data(), fixed_points[i].data(), fixed_camera.data());
+    problem.SetParameterBlockConstant(fixed_points[i].data());
+  }
+  problem.SetParameterBlockConstant(fixed_camera.data());
+  ceres::Solver::Options solver;
+  solver.max_num_iterations = options.max_num_iterations;
+  solver.gradient_tolerance = options.gradient_tolerance;
+  solver.linear_solver_type = ceres::DENSE_QR;
+  solver.logging_type = ceres::SILENT;
+  solver.minimizer_progress_to_stdout = false;
+  solver.num_threads = 1;
+  ceres::Solver::Summary solved;
+  ceres::Solve(solver, &problem, &solved);
+  summary.num_iterations = static_cast<int>(solved.iterations.size());
+  summary.initial_cost = solved.initial_cost;
+  summary.final_cost = solved.final_cost;
+  summary.message = solved.BriefReport();
+  summary.success = solved.IsSolutionUsable() && std::isfinite(solved.initial_cost) &&
+      std::isfinite(solved.final_cost) && solved.final_cost >= 0 &&
+      solved.final_cost <= solved.initial_cost + 1e-10 * std::max(1.0, solved.initial_cost) &&
+      q.coeffs().allFinite() && std::isfinite(q.norm()) && q.norm() > 0 && translation.allFinite();
+  if (summary.success) {
+    pose->q_cw = q.normalized();
+    pose->t_cw = translation;
+  } else {
+    summary.message += "; pose unchanged (unusable or non-finite solution)";
+  }
+  VLOG(1) << "Absolute pose refinement: " << summary.message;
+  return summary;
+}
+
 ImageRegistrationSummary RegisterImageWithExistingPoints(
     const MatchGraph& graph,
     ImageId image_id,
@@ -447,6 +484,12 @@ ImageRegistrationSummary RegisterImageWithExistingPoints(
     Reconstruction* reconstruction) {
   ImageRegistrationSummary summary;
   summary.image_id = image_id;
+
+  if (!std::isfinite(options.min_inlier_ratio) || options.min_inlier_ratio < 0.0 ||
+      options.min_inlier_ratio > 1.0) {
+    summary.message = "Invalid PnP minimum inlier ratio";
+    return summary;
+  }
 
   if (reconstruction == nullptr || !reconstruction->ExistsImage(image_id)) {
     summary.message = "Image is missing in reconstruction";
@@ -470,14 +513,32 @@ ImageRegistrationSummary RegisterImageWithExistingPoints(
   const PnPRansacResult result =
       EstimatePoseRansac(camera, correspondences, options);
   summary.num_ransac_inliers = result.num_inliers_before_final_refinement;
+  summary.num_ransac_iterations = result.num_iterations;
   summary.num_inliers = result.inlier_indices.size();
-  if (summary.num_inliers < options.min_num_inliers) {
+  if (summary.num_inliers < options.min_num_inliers ||
+      static_cast<double>(summary.num_inliers) <
+          options.min_inlier_ratio * correspondences.size()) {
     summary.message = "PnP RANSAC failed or found too few inliers";
     return summary;
   }
 
+  std::vector<Eigen::Vector2d> pixels;
+  std::vector<Eigen::Vector3d> points;
+  std::vector<char> inlier_mask(correspondences.size(), false);
+  pixels.reserve(correspondences.size()); points.reserve(correspondences.size());
+  for (const auto& correspondence : correspondences) {
+    pixels.push_back(correspondence.xy); points.push_back(correspondence.xyz);
+  }
+  for (const auto index : result.inlier_indices) inlier_mask[index] = true;
+  Pose3 refined_pose = result.pose;
+  summary.refinement = RefineAbsolutePose(
+      options.refinement, camera, pixels, points, inlier_mask, &refined_pose);
+  if (!summary.refinement.success) {
+    summary.message = "PnP pose refinement failed: " + summary.refinement.message;
+    return summary;
+  }
   Image& mutable_image = reconstruction->GetImage(image_id);
-  mutable_image.cam_from_world = result.pose;
+  mutable_image.cam_from_world = refined_pose;
   reconstruction->RegisterImage(image_id);
   LinkInlierCorrespondencesToImage(image_id, correspondences,
                                    result.inlier_indices, reconstruction);

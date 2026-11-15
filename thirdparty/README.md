@@ -5,7 +5,7 @@ repository. It is a source snapshot rather than a Git submodule.
 
 | Directory | Upstream snapshot | License | Use |
 |---|---|---|---|
-| `PoissonRecon` | Source bundled from the COLMAP reference integration | MIT; see `PoissonRecon/LICENSE` | Compiled into Colite as `colite_poisson_recon` |
+| `PoissonRecon` | Source bundled from the COLMAP reference integration | MIT directory LICENSE and per-file BSD notices; retain both | Compiled into Colite as `colite_poisson_recon` |
 
 The production VLFeat-style SIFT backend contains an optimized adaptation of
 VLFeat routines, but the full VLFeat source tree is not vendored. Its BSD

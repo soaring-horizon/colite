@@ -4,22 +4,26 @@
 
 #include "colite/core/camera.h"
 #include "colite/core/feature.h"
+#include "colite/core/match_graph.h"
 #include "colite/core/two_view_geometry.h"
 
 namespace colite {
 
-// 两视图几何验证参数。当前实现使用内部 RANSAC + DLT/八点法估计 F/H/E。
+// 两视图几何验证参数。启用 PoseLib 时最小采样使用七点 F、五点 E，
+// 否则均回退八点法；F/E 非最小细化使用八点法，H 使用 DLT。
 struct TwoViewGeometryOptions {
   // RANSAC 内点阈值，单位为像素。用于 F/H；E 会换算到归一化平面。
   double max_error_px = 4.0;
 
-  // RANSAC 置信度。当前保留该参数用于接口兼容，后续 LORANSAC 会使用。
+  // RANSAC 置信度，用于自适应迭代次数。
   double confidence = 0.999;
+  // RANSAC prior for the trial budget, not an acceptance threshold.
+  double min_inlier_ratio = 0.25;
+  int random_seed = -1;
 
   // 内部 RANSAC 最大迭代次数。
-  // COLMAP-style adaptive robust-estimation bounds. The estimator always
-  // performs at least min_num_iterations and may continue until confidence is
-  // reached or max_num_iterations is exhausted.
+  // Adaptive stopping is bounded by the prior, confidence and trial cap.
+  // Perfect support and a strong prior can stop before min_num_iterations.
   int min_num_iterations = 100;
   int max_num_iterations = 10000;
 
@@ -32,11 +36,18 @@ struct TwoViewGeometryOptions {
   // H 的内点数接近 E/F 时，认为该图像对更可能是平面或纯旋转退化。
   double max_H_inlier_ratio = 0.8;
 
-  // 三角化角低于该阈值时，将 H 退化从平面进一步判定为全景/纯旋转。
-  double max_panoramic_triangulation_angle_deg = 0.1;
+  bool compute_relative_pose = false;
+  bool detect_watermark = true;
+  bool multiple_models = false;
+  bool multiple_ignore_watermark = true;
+  double watermark_min_inlier_ratio = 0.7;
+  double watermark_border_size = 0.1;
+  double watermark_detection_max_error = 4.0;
+  bool filter_stationary_matches = false;
+  double stationary_matches_max_error = 4.0;
+  bool force_H_use = false;  // Core API only, as in COLMAP 4.0.
 
-  // 是否同时估计单应矩阵。单应矩阵主要用于后续平面/全景退化判断。
-  bool estimate_homography = true;
+  void Check() const;
 };
 
 // 根据两张图像的特征匹配估计两视图几何关系。
@@ -48,5 +59,22 @@ TwoViewGeometry EstimateTwoViewGeometry(
     const FeatureSet& features2,
     const std::vector<FeatureMatch>& matches,
     const TwoViewGeometryOptions& options = {});
+
+// Test the supplied calibration even if no focal-length prior is recorded.
+// E/F/H still compete as in the calibrated COLMAP estimator.
+TwoViewGeometry EstimateCalibratedTwoViewGeometry(
+    const Camera& camera1, const FeatureSet& features1,
+    const Camera& camera2, const FeatureSet& features2,
+    const std::vector<FeatureMatch>& matches,
+    const TwoViewGeometryOptions& options = {});
+
+bool EstimateTwoViewGeometryPose(
+    const Camera& camera1, const FeatureSet& features1,
+    const Camera& camera2, const FeatureSet& features2, TwoViewGeometry* geometry);
+
+// Recover missing poses/parallax in memory. PLANAR_OR_PANORAMIC can resolve to
+// PLANAR/PANORAMIC; matrices and inlier sets are unchanged.
+std::size_t RecoverMatchGraphRelativePoses(
+    const std::map<ImageId, Camera>& cameras_by_image, MatchGraph* graph);
 
 }  // namespace colite

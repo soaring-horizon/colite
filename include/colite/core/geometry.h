@@ -17,6 +17,9 @@ struct Point3D;
 Eigen::Vector3d PixelToBearing(const Camera& camera,
                                const Eigen::Vector2d& pixel);
 
+std::optional<Eigen::Vector3d> TryPixelToBearing(
+    const Camera& camera, const Eigen::Vector2d& pixel);
+
 // 将世界坐标点投影到图像平面。
 // 返回 std::nullopt 表示点位于相机后方或深度无效。
 std::optional<Eigen::Vector2d> ProjectWorldPoint(
@@ -32,12 +35,16 @@ std::optional<double> ReprojectionError(
     const Eigen::Vector3d& point_world,
     const Eigen::Vector2d& observed_pixel);
 
-// COLMAP text models store the root mean squared reprojection error of all
+// COLMAP models store the mean Euclidean reprojection error of all
 // valid observations in a track. Returns nullopt when the track has no valid
 // posed observation.
 std::optional<double> Point3DTrackReprojectionError(
     const Reconstruction& reconstruction,
     const Point3D& point3d);
+
+// Refresh stored ERROR fields after geometry or tracks change. Serialization
+// itself preserves these fields, so format conversion does not alter a model.
+void UpdatePoint3DReprojectionErrors(Reconstruction* reconstruction);
 
 // 根据两张图像的位姿和像素观测进行线性三角化。
 // 输入位姿均采用 world -> camera 约定，输出点位于世界坐标系。
@@ -50,11 +57,25 @@ std::optional<Eigen::Vector3d> TriangulatePoint(
     const Pose3& cam2_from_world,
     const Eigen::Vector2d& pixel2);
 
+// Same linear solver for callers that have already unprojected observations.
+std::optional<Eigen::Vector3d> TriangulatePointFromNormalized(
+    const Eigen::Matrix<double, 3, 4>& projection1,
+    const Eigen::Vector2d& normalized1,
+    const Eigen::Matrix<double, 3, 4>& projection2,
+    const Eigen::Vector2d& normalized2);
+
 // 计算两条观测射线之间的夹角，单位为角度。
 // 该值常用于过滤基线过小、三角化不稳定的 track。
 double TriangulationAngleDegrees(const Pose3& cam1_from_world,
                                  const Eigen::Vector3d& bearing1,
                                  const Pose3& cam2_from_world,
                                  const Eigen::Vector3d& bearing2);
+
+// Angle of the optimized world point and camera centers, independent of the
+// measured pixels. Uses the smaller intersection angle in [0, 90] degrees;
+// zero-length or non-finite directions are unconstrained and return zero.
+double TriangulationAngleDegrees(const Eigen::Vector3d& camera_center1,
+                                 const Eigen::Vector3d& camera_center2,
+                                 const Eigen::Vector3d& point_world);
 
 }  // namespace colite

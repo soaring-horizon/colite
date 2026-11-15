@@ -21,17 +21,18 @@ Eigen::Matrix<double, 3, 4> ProjectionMatrixFromPose(
   return projection;
 }
 
-Eigen::Vector2d NormalizedPointFromPixel(const Camera& camera,
-                                         const Eigen::Vector2d& pixel) {
-  const Eigen::Vector3d ray = UnprojectPixel(camera, pixel, 1.0);
-  return {ray.x() / ray.z(), ray.y() / ray.z()};
-}
-
 }  // namespace
 
 Eigen::Vector3d PixelToBearing(const Camera& camera,
                                const Eigen::Vector2d& pixel) {
   return UnprojectPixel(camera, pixel, 1.0).normalized();
+}
+
+std::optional<Eigen::Vector3d> TryPixelToBearing(
+    const Camera& camera, const Eigen::Vector2d& pixel) {
+  const auto ray = TryUnprojectPixel(camera, pixel, 1.0);
+  if (!ray || !std::isfinite(ray->norm()) || ray->norm() == 0) return std::nullopt;
+  return ray->normalized();
 }
 
 std::optional<Eigen::Vector2d> ProjectWorldPoint(
@@ -65,7 +66,7 @@ std::optional<double> ReprojectionError(
 std::optional<double> Point3DTrackReprojectionError(
     const Reconstruction& reconstruction,
     const Point3D& point3d) {
-  double squared_error_sum = 0.0;
+  double error_sum = 0.0;
   std::size_t num_observations = 0;
   for (const TrackElement& element : point3d.track.elements) {
     if (!reconstruction.ExistsImage(element.image_id)) {
@@ -82,14 +83,20 @@ std::optional<double> Point3DTrackReprojectionError(
     if (!error || !std::isfinite(*error)) {
       continue;
     }
-    squared_error_sum += *error * *error;
+    error_sum += *error;
     ++num_observations;
   }
   if (num_observations == 0) {
     return std::nullopt;
   }
-  return std::sqrt(squared_error_sum /
-                   static_cast<double>(num_observations));
+  return error_sum / static_cast<double>(num_observations);
+}
+
+void UpdatePoint3DReprojectionErrors(Reconstruction* reconstruction) {
+  for (const auto& [id, point] : reconstruction->Points3D()) {
+    reconstruction->GetPoint3D(id).reprojection_error =
+        Point3DTrackReprojectionError(*reconstruction, point).value_or(-1.0);
+  }
 }
 
 std::optional<Eigen::Vector3d> TriangulatePoint(
@@ -99,12 +106,24 @@ std::optional<Eigen::Vector3d> TriangulatePoint(
     const Camera& camera2,
     const Pose3& cam2_from_world,
     const Eigen::Vector2d& pixel2) {
-  const Eigen::Vector2d x1 = NormalizedPointFromPixel(camera1, pixel1);
-  const Eigen::Vector2d x2 = NormalizedPointFromPixel(camera2, pixel2);
+  const auto ray1 = TryUnprojectPixel(camera1, pixel1, 1.0);
+  const auto ray2 = TryUnprojectPixel(camera2, pixel2, 1.0);
+  if (!ray1 || !ray2) return std::nullopt;
+  const Eigen::Vector2d x1(ray1->x() / ray1->z(), ray1->y() / ray1->z());
+  const Eigen::Vector2d x2(ray2->x() / ray2->z(), ray2->y() / ray2->z());
   const Eigen::Matrix<double, 3, 4> p1 =
       ProjectionMatrixFromPose(cam1_from_world);
   const Eigen::Matrix<double, 3, 4> p2 =
       ProjectionMatrixFromPose(cam2_from_world);
+
+  return TriangulatePointFromNormalized(p1, x1, p2, x2);
+}
+
+std::optional<Eigen::Vector3d> TriangulatePointFromNormalized(
+    const Eigen::Matrix<double, 3, 4>& p1,
+    const Eigen::Vector2d& x1,
+    const Eigen::Matrix<double, 3, 4>& p2,
+    const Eigen::Vector2d& x2) {
 
   Eigen::Matrix4d a;
   a.row(0) = x1.x() * p1.row(2) - p1.row(0);
@@ -136,6 +155,19 @@ double TriangulationAngleDegrees(const Pose3& cam1_from_world,
   const double cos_angle =
       std::clamp(ray1_world.dot(ray2_world), -1.0, 1.0);
   return std::acos(cos_angle) * kRadiansToDegrees;
+}
+
+double TriangulationAngleDegrees(const Eigen::Vector3d& camera_center1,
+                                 const Eigen::Vector3d& camera_center2,
+                                 const Eigen::Vector3d& point_world) {
+  const Eigen::Vector3d ray1 = point_world - camera_center1;
+  const Eigen::Vector3d ray2 = point_world - camera_center2;
+  const double length1 = ray1.norm();
+  const double length2 = ray2.norm();
+  if (!(length1 > 0) || !(length2 > 0) ||
+      !std::isfinite(length1) || !std::isfinite(length2)) return 0;
+  const double cosine = std::clamp(std::abs((ray1 / length1).dot(ray2 / length2)), 0.0, 1.0);
+  return std::acos(cosine) * kRadiansToDegrees;
 }
 
 }  // namespace colite

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -122,6 +123,11 @@ Eigen::Vector2d ProjectPoint(const Camera& camera,
 Eigen::Vector3d UnprojectPixel(const Camera& camera,
                                const Eigen::Vector2d& pixel,
                                double depth);
+
+// A valid camera can have pixels outside its invertible domain. Only this
+// observation failure returns nullopt; invalid camera/depth arguments throw.
+std::optional<Eigen::Vector3d> TryUnprojectPixel(
+    const Camera& camera, const Eigen::Vector2d& pixel, double depth);
 
 Eigen::Vector2d ApplySimpleRadialDistortion(const Eigen::Vector2d& normalized,
                                             double k1);

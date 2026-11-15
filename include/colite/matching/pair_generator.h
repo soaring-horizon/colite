@@ -15,17 +15,19 @@ enum class MatchingStrategy {
   kSequential,
   kSpatial,
   kVocabTree,
+  kTransitive,
 };
 
 struct MatchingPairGeneratorOptions {
   MatchingStrategy strategy = MatchingStrategy::kSequential;
 
-  // sequential：每张图像与文件顺序中的后续 N 张图像配对。
-  std::size_t sequential_overlap = 5;
+  // COLMAP: quadratic uses offsets 1, 2, 4, ...; linear uses 1, 2, 3, ... .
+  std::size_t sequential_overlap = 10;
+  bool sequential_quadratic_overlap = true;
 
   // spatial：每张图像连接空间距离最近的 N 个邻居；max_distance<=0 表示不限制距离。
-  std::size_t spatial_max_num_neighbors = 10;
-  double spatial_max_distance = 0.0;
+  std::size_t spatial_max_num_neighbors = 50;
+  double spatial_max_distance = 100.0;
 
   // vocab tree：用当前 workspace 特征临时训练视觉词，按 TF-IDF 检索候选图像。
   // 这是文件式 workspace 的轻量实现，后续可替换为持久化/导入的 COLMAP vocab tree。
@@ -40,6 +42,11 @@ struct MatchingPairGeneratorOptions {
   // COLITE_VOCAB_TREE <version> <descriptor_dim>
   // 后续每行一个 visual word descriptor。为空时保留轻量临时训练路径。
   std::filesystem::path vocab_tree_path;
+
+  // transitive: expand only previously verified connectivity, then run the
+  // configured real descriptor matcher and geometric verification.
+  std::size_t transitive_max_path_length = 2;
+  std::size_t transitive_max_num_neighbors = 20;
 };
 
 struct MatchingPairGeneratorSummary {

@@ -32,7 +32,7 @@ std::uint64_t CellKey(const int x, const int y) {
          static_cast<std::uint32_t>(y);
 }
 
-// Keep this metric identical to D:/Code/CXX/Sift/demo/cuda_sift_compare.cpp.
+// Compare directional overlap with the same position and descriptor thresholds.
 OverlapMetrics CompareCpuGpu(const FeatureSet& cpu, const FeatureSet& gpu) {
   constexpr float kCellSize = 1.5F;
   std::unordered_map<std::uint64_t, std::vector<std::size_t>> grid;
@@ -123,12 +123,11 @@ void VerifyCpuGpuOverlap(const SiftBackend cpu_backend,
   cpu_options.backend = cpu_backend;
   cpu_options.max_num_features = 0;
   cpu_options.use_root_sift = false;
-  cpu_options.cuda_num_octaves = 0;
   if (cpu_backend == SiftBackend::kVlSift) {
     // 3.4 / 255 is the normalized equivalent of the Sift project benchmark's
     // VLFeat peak_thresh=3.4 on a [0, 255] float image.
-    cpu_options.contrast_threshold = 3.4 / 255.0;
-    cpu_options.vl_num_octaves = -1;
+    cpu_options.peak_threshold = 3.4 / 255.0;
+    cpu_options.num_octaves = -1;
     cpu_options.max_num_orientations = 4;
   }
   SiftExtractionOptions gpu_options = cpu_options;

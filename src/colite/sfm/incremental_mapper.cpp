@@ -4,15 +4,43 @@
 #include <chrono>
 #include <cmath>
 #include <map>
+#include <limits>
 #include <optional>
 #include <set>
+#include <stdexcept>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+#include <glog/logging.h>
 
 #include "colite/core/geometry.h"
+#include "colite/core/memory.h"
+#include "colite/sfm/similarity_transform.h"
+#include "refinement_diagnostics.h"
 
 namespace colite {
 namespace {
+
+class ScopedPoint3DChanges {
+ public:
+  explicit ScopedPoint3DChanges(Reconstruction* reconstruction)
+      : reconstruction_(reconstruction) {
+    if (reconstruction_) reconstruction_->BeginPoint3DChangeTracking();
+  }
+  ~ScopedPoint3DChanges() {
+    if (reconstruction_) reconstruction_->EndPoint3DChangeTracking();
+  }
+  ScopedPoint3DChanges(const ScopedPoint3DChanges&) = delete;
+  ScopedPoint3DChanges& operator=(const ScopedPoint3DChanges&) = delete;
+  std::set<Point3DId> Finish() {
+    auto* reconstruction = reconstruction_;
+    reconstruction_ = nullptr;
+    return reconstruction ? reconstruction->EndPoint3DChangeTracking()
+                          : std::set<Point3DId>{};
+  }
+ private:
+  Reconstruction* reconstruction_;
+};
 
 using MappingClock = std::chrono::steady_clock;
 
@@ -31,18 +59,12 @@ struct ImageCandidate {
   std::size_t num_registration_attempts = 0;
 };
 
-bool PairContainsImage(const ImagePair& pair, ImageId image_id) {
-  return pair.image_id1 == image_id || pair.image_id2 == image_id;
-}
-
 ImageId OtherImageId(const ImagePair& pair, ImageId image_id) {
   return pair.image_id1 == image_id ? pair.image_id2 : pair.image_id1;
 }
 
 bool IsUsableGeometry(const TwoViewGeometry& geometry) {
-  return geometry.type != TwoViewGeometry::Type::kUndefined &&
-         geometry.type != TwoViewGeometry::Type::kDegenerate &&
-         !geometry.inlier_matches.empty();
+  return geometry.HasUsableCorrespondences();
 }
 
 bool HasValidFeatureIndex(const FeatureSet* features, Point2DIdx idx) {
@@ -59,9 +81,26 @@ double ComputeCandidateScore(const ImageCandidate& candidate) {
              0.01;
 }
 
+using CandidateNeighborIndex = std::map<ImageId, std::vector<MatchGraphEdge>>;
+
+CandidateNeighborIndex BuildCandidateNeighborIndex(const MatchGraph& graph) {
+  CandidateNeighborIndex neighbors;
+  // Preserve verified_geometries iteration order so candidate scoring and
+  // registration order remain identical to the full-graph scan.
+  for (const auto& [pair, geometry] : graph.verified_geometries) {
+    if (!IsUsableGeometry(geometry)) continue;
+    neighbors[pair.image_id1].push_back({pair, &geometry});
+    if (pair.image_id2 != pair.image_id1) {
+      neighbors[pair.image_id2].push_back({pair, &geometry});
+    }
+  }
+  return neighbors;
+}
+
 ImageCandidate AnalyzeImageCandidate(const MatchGraph& graph,
                                      ImageId image_id,
-                                     const Reconstruction& reconstruction) {
+                                     const Reconstruction& reconstruction,
+                                     const CandidateNeighborIndex& neighbors) {
   ImageCandidate candidate;
   candidate.image_id = image_id;
   if (!reconstruction.ExistsImage(image_id) ||
@@ -74,13 +113,13 @@ ImageCandidate AnalyzeImageCandidate(const MatchGraph& graph,
     return candidate;
   }
 
-  std::set<ImageId> registered_neighbors;
-  std::set<Point2DIdx> visible_target_points;
-  std::set<Point3DId> visible_point3d_ids;
-  for (const auto& [pair, geometry] : graph.verified_geometries) {
-    if (!PairContainsImage(pair, image_id) || !IsUsableGeometry(geometry)) {
-      continue;
-    }
+  std::vector<bool> visible_target_points(target_features->keypoints.size(), false);
+  std::unordered_set<Point3DId> visible_point3d_ids;
+  const auto neighbors_it = neighbors.find(image_id);
+  if (neighbors_it == neighbors.end()) return candidate;
+  for (const auto& edge : neighbors_it->second) {
+    const auto& pair = edge.pair;
+    const auto& geometry = *edge.geometry;
 
     const ImageId neighbor_id = OtherImageId(pair, image_id);
     if (!reconstruction.ExistsImage(neighbor_id) ||
@@ -88,7 +127,7 @@ ImageCandidate AnalyzeImageCandidate(const MatchGraph& graph,
       continue;
     }
 
-    registered_neighbors.insert(neighbor_id);
+    ++candidate.num_registered_neighbors;
     candidate.num_verified_inliers_to_registered_images +=
         geometry.inlier_matches.size();
 
@@ -106,13 +145,15 @@ ImageCandidate AnalyzeImageCandidate(const MatchGraph& graph,
       const Point2D& neighbor_point = neighbor_image.points2d[neighbor_idx];
       if (neighbor_point.HasPoint3D() &&
           reconstruction.ExistsPoint3D(neighbor_point.point3d_id)) {
-        visible_target_points.insert(target_idx);
+        if (!visible_target_points[target_idx]) {
+          visible_target_points[target_idx] = true;
+          ++candidate.num_visible_points;
+        }
         visible_point3d_ids.insert(neighbor_point.point3d_id);
       }
     }
   }
 
-  candidate.num_visible_points = visible_target_points.size();
   for (const Point3DId point3d_id : visible_point3d_ids) {
     candidate.num_visible_observations +=
         reconstruction.GetPoint3D(point3d_id).track.Length();
@@ -122,7 +163,6 @@ ImageCandidate AnalyzeImageCandidate(const MatchGraph& graph,
         static_cast<double>(candidate.num_visible_observations) /
         static_cast<double>(visible_point3d_ids.size());
   }
-  candidate.num_registered_neighbors = registered_neighbors.size();
   candidate.score = ComputeCandidateScore(candidate);
   return candidate;
 }
@@ -133,7 +173,11 @@ std::vector<ImageCandidate> CollectImageCandidates(
     const Reconstruction& reconstruction,
     const std::set<ImageId>* allowed_image_ids = nullptr,
     const std::map<ImageId, std::size_t>* registration_trials = nullptr,
-    std::size_t max_num_registration_trials_per_image = 0) {
+    std::size_t max_num_registration_trials_per_image = 0,
+    const CandidateNeighborIndex* neighbors = nullptr) {
+  const auto owned_neighbors = neighbors == nullptr
+      ? BuildCandidateNeighborIndex(graph) : CandidateNeighborIndex{};
+  if (neighbors == nullptr) neighbors = &owned_neighbors;
   std::vector<ImageCandidate> candidates;
   for (const auto& [image_id, image] : reconstruction.Images()) {
     (void)image;
@@ -142,7 +186,7 @@ std::vector<ImageCandidate> CollectImageCandidates(
       continue;
     }
     ImageCandidate candidate =
-        AnalyzeImageCandidate(graph, image_id, reconstruction);
+        AnalyzeImageCandidate(graph, image_id, reconstruction, *neighbors);
     if (registration_trials != nullptr) {
       const auto trial_it = registration_trials->find(image_id);
       if (trial_it != registration_trials->end()) {
@@ -154,8 +198,14 @@ std::vector<ImageCandidate> CollectImageCandidates(
             max_num_registration_trials_per_image) {
       continue;
     }
-    if (candidate.num_visible_points >=
-        options.registration.min_num_correspondences) {
+    const bool pnp_ready = candidate.num_visible_points >=
+                           options.registration.min_num_correspondences;
+    const bool structureless_ready =
+        options.use_structureless_registration &&
+        candidate.num_registered_neighbors >=
+            options.structureless_registration
+                .min_num_registered_neighbors;
+    if (pnp_ready || structureless_ready) {
       candidates.push_back(candidate);
     }
   }
@@ -259,15 +309,6 @@ ImageRegistrarOptions RegistrationOptionsForAttempt(
   return options;
 }
 
-std::set<Point3DId> CollectPoint3DIds(const Reconstruction& reconstruction) {
-  std::set<Point3DId> point3d_ids;
-  for (const auto& [point3d_id, point3d] : reconstruction.Points3D()) {
-    (void)point3d;
-    point3d_ids.insert(point3d_id);
-  }
-  return point3d_ids;
-}
-
 bool HasLargeReprojectionError(const Reconstruction& reconstruction,
                                const Point3D& point3d,
                                const TrackElement& element,
@@ -288,7 +329,8 @@ bool HasLargeReprojectionError(const Reconstruction& reconstruction,
 }
 
 double MaxTriangulationAngleDegrees(const Reconstruction& reconstruction,
-                                    const Point3D& point3d) {
+                                    const Point3D& point3d,
+                                    double required_angle) {
   double max_angle = 0.0;
   for (std::size_t i = 0; i < point3d.track.elements.size(); ++i) {
     const TrackElement& element1 = point3d.track.elements[i];
@@ -301,8 +343,8 @@ double MaxTriangulationAngleDegrees(const Reconstruction& reconstruction,
       continue;
     }
     const Camera& camera1 = reconstruction.GetCamera(image1.camera_id);
-    const Eigen::Vector3d bearing1 =
-        PixelToBearing(camera1, image1.points2d[element1.point2d_idx].xy);
+    const auto bearing1 = TryPixelToBearing(camera1, image1.points2d[element1.point2d_idx].xy);
+    if (!bearing1) continue;
 
     for (std::size_t j = i + 1; j < point3d.track.elements.size(); ++j) {
       const TrackElement& element2 = point3d.track.elements[j];
@@ -316,20 +358,21 @@ double MaxTriangulationAngleDegrees(const Reconstruction& reconstruction,
         continue;
       }
       const Camera& camera2 = reconstruction.GetCamera(image2.camera_id);
-      const Eigen::Vector3d bearing2 =
-          PixelToBearing(camera2, image2.points2d[element2.point2d_idx].xy);
+      const auto bearing2 = TryPixelToBearing(camera2, image2.points2d[element2.point2d_idx].xy);
+      if (!bearing2) continue;
       max_angle = std::max(max_angle,
                            TriangulationAngleDegrees(*image1.cam_from_world,
-                                                     bearing1,
+                                                     *bearing1,
                                                      *image2.cam_from_world,
-                                                     bearing2));
+                                                     *bearing2));
+      if (max_angle >= required_angle) return max_angle;
     }
   }
   return max_angle;
 }
 
 ObservationFilterSummary FilterNewlyCreatedPoints(
-    const std::set<Point3DId>& point_ids_before,
+    Point3DId first_created_point_id,
     const ObservationFilterOptions& options,
     Reconstruction* reconstruction) {
   ObservationFilterSummary summary;
@@ -344,10 +387,11 @@ ObservationFilterSummary FilterNewlyCreatedPoints(
     Point2DIdx point2d_idx;
   };
   std::vector<ObservationToDelete> observations_to_delete;
-  for (const auto& [point3d_id, point3d] : reconstruction->Points3D()) {
-    if (point_ids_before.find(point3d_id) != point_ids_before.end()) {
-      continue;
-    }
+  const Point3DId end_point_id = reconstruction->NextPoint3DId();
+  for (Point3DId point3d_id = first_created_point_id;
+       point3d_id < end_point_id; ++point3d_id) {
+    if (!reconstruction->ExistsPoint3D(point3d_id)) continue;
+    const Point3D& point3d = reconstruction->GetPoint3D(point3d_id);
     for (const TrackElement& element : point3d.track.elements) {
       if (HasLargeReprojectionError(*reconstruction, point3d, element,
                                     options.max_reprojection_error_px)) {
@@ -365,12 +409,13 @@ ObservationFilterSummary FilterNewlyCreatedPoints(
   }
 
   std::vector<Point3DId> points_to_delete;
-  for (const auto& [point3d_id, point3d] : reconstruction->Points3D()) {
-    if (point_ids_before.find(point3d_id) != point_ids_before.end()) {
-      continue;
-    }
+  for (Point3DId point3d_id = first_created_point_id;
+       point3d_id < end_point_id; ++point3d_id) {
+    if (!reconstruction->ExistsPoint3D(point3d_id)) continue;
+    const Point3D& point3d = reconstruction->GetPoint3D(point3d_id);
     if (point3d.track.Length() < options.min_track_length ||
-        MaxTriangulationAngleDegrees(*reconstruction, point3d) <
+        MaxTriangulationAngleDegrees(*reconstruction, point3d,
+                                     options.min_triangulation_angle_deg) <
             options.min_triangulation_angle_deg) {
       points_to_delete.push_back(point3d_id);
     }
@@ -406,6 +451,134 @@ void AccumulateTriangulationSummary(
   summary->num_merged_observations += update.num_merged_observations;
   summary->num_filtered_observations += update.num_filtered_observations;
   summary->num_filtered_points += update.num_filtered_points;
+  summary->message = update.message;
+}
+
+GlobalBundleAdjustmentOptions MappingGlobalBundleOptions(
+    const IncrementalMappingOptions& options, const Reconstruction& model) {
+  auto ba = options.global_bundle_adjustment;
+  if (model.RegisteredImageIds().size() < 10) {
+    if (ba.max_num_iterations > 0)
+      ba.max_num_iterations = ba.max_num_iterations > std::numeric_limits<int>::max()/2
+          ? std::numeric_limits<int>::max() : 2 * ba.max_num_iterations;
+    ba.solver.function_tolerance /= 10;
+    ba.solver.gradient_tolerance /= 10;
+    ba.solver.parameter_tolerance /= 10;
+    ba.solver.max_linear_solver_iterations = 200;
+  }
+  if (model.RegisteredImageIds().size() <= 2) ba.use_position_priors = false;
+  return ba;
+}
+
+InitialPairRefinementSummary RefineInitialPair(
+    const IncrementalMappingOptions& options, Reconstruction* model,
+    IncrementalMappingSummary* mapping) {
+  InitialPairRefinementSummary result;
+  result.num_points_before = model->Points3D().size();
+  if (options.run_global_bundle_adjustment) {
+    result.negative_depth_filter = FilterObservationsWithNegativeDepth(model);
+    if (!result.negative_depth_filter.success || model->Points3D().empty()) {
+      result.message = "Initial reconstruction has no positive-depth points";
+      return result;
+    }
+    result.bundle_adjustment_attempted = true;
+    const auto start = MappingClock::now();
+    result.bundle_adjustment = AdjustGlobalBundle(MappingGlobalBundleOptions(options, *model), model);
+    mapping->initial_bundle_adjustment_seconds += ElapsedSeconds(start);
+    mapping->num_global_ba_invalid_steps += result.bundle_adjustment.num_invalid_steps;
+    if (!result.bundle_adjustment.success) {
+      result.message = "Initial bundle adjustment failed: " + result.bundle_adjustment.message;
+      return result;
+    }
+  }
+  // Absolute position priors retain their target units. Their final alignment
+  // remains the controller's responsibility.
+  if (!options.global_bundle_adjustment.use_position_priors) {
+    const auto normalization = NormalizeReconstruction(model);
+    result.normalized = true;
+    result.normalization_scale = normalization.scale;
+  }
+  if (options.run_global_observation_filter) {
+    result.observation_filter = FilterObservationsAndPoints(options.global_observation_filter, model);
+    if (!result.observation_filter.success) {
+      result.message = result.observation_filter.message;
+      return result;
+    }
+  }
+  result.num_points_after = model->Points3D().size();
+  result.success = model->RegisteredImageIds().size() >= 2 &&
+      !model->Points3D().empty() &&
+      model->Points3D().size() >= options.mapper.registration.min_num_inliers;
+  result.message = result.success ? "Initial reconstruction refined" :
+      "Initial reconstruction has too few points for absolute pose registration";
+  return result;
+}
+
+IncrementalInitializerSummary InitializeMappingFromCandidates(
+    const MatchGraph& graph, const IncrementalInitializerOptions& initialization,
+    const IncrementalTriangulatorCache& triangulator_cache,
+    const IncrementalMappingOptions& options, InitialPairTrialState* trial_state,
+    std::size_t* num_model_trials,
+    IncrementalMappingSummary* mapping, Reconstruction* reconstruction) {
+  IncrementalInitializerSummary last;
+  std::vector<ImagePair> checked;
+  const auto candidates = SelectInitialImagePairCandidates(graph, initialization, reconstruction, trial_state);
+  for (const auto pair : candidates) {
+    if (*num_model_trials >= options.max_num_initialization_trials) {
+      last.message = "Initial reconstruction trial budget exhausted";
+      break;
+    }
+    const auto key = ImagePair::Ordered(pair.image_id1, pair.image_id2);
+    if (trial_state->tried_pairs.count(key)) continue;
+    if (initialization.image_id1 == kInvalidImageId && initialization.image_id2 == kInvalidImageId &&
+        trial_state->num_reg_trials[pair.image_id1] >= initialization.max_num_reg_trials) continue;
+    trial_state->tried_pairs.insert(key);
+    // Publish only a fully refined candidate: failed BA/filtering cannot leak
+    // intrinsics, poses, point IDs or links into another trial or the caller.
+    Reconstruction candidate = *reconstruction;
+    checked.push_back(pair);
+    last = RegisterInitialImagePair(graph, pair, initialization, &candidate);
+    if (!last.geometry_accepted) continue;
+    ++*num_model_trials;
+    ++trial_state->num_reg_trials[pair.image_id1];
+    ++trial_state->num_reg_trials[pair.image_id2];
+    if (last.success) {
+      auto triangulation = options.mapper.triangulation;
+      triangulation.min_triangulation_angle_deg = initialization.min_triangulation_angle_deg;
+      for (const auto id : {pair.image_id1, pair.image_id2})
+        TriangulateRegisteredImage(graph, id, triangulation, &candidate, &triangulator_cache);
+      last.num_triangulated_points = candidate.Points3D().size();
+      if (candidate.Points3D().empty() || candidate.Points3D().size() < initialization.min_num_triangulated_points) {
+        last.success = false;
+        last.message = "Initial pair produced too few triangulated points";
+      }
+    }
+    InitialPairRefinementSummary refined;
+    if (last.success) {
+      try {
+        refined = RefineInitialPair(options, &candidate, mapping);
+      } catch (const std::invalid_argument& error) {
+        refined.num_points_before = last.num_triangulated_points;
+        refined.num_points_after = candidate.Points3D().size();
+        refined.message = std::string("Initial refinement failed: ") + error.what();
+      }
+    } else {
+      refined.num_points_before = last.num_triangulated_points;
+      refined.message = last.message;
+    }
+    refined.pair = pair;
+    mapping->initialization_refinements.push_back(refined);
+    last.success = refined.success;
+    last.message = refined.message;
+    if (last.success) {
+      *reconstruction = std::move(candidate);
+      break;
+    }
+  }
+  last.attempted_initial_pairs = std::move(checked);
+  last.num_initialization_attempts = last.attempted_initial_pairs.size();
+  if (last.message.empty()) last.message = "No usable initial image pair";
+  return last;
 }
 
 }  // namespace
@@ -423,6 +596,12 @@ IncrementalMapperSummary RegisterNextImage(
     summary.message = "Image is missing in reconstruction";
     return summary;
   }
+  if (options.ba_local_max_refinements == 0 ||
+      !std::isfinite(options.ba_local_max_refinement_change) ||
+      options.ba_local_max_refinement_change < 0.0) {
+    summary.message = "Invalid local refinement limit or change threshold";
+    return summary;
+  }
   summary.registration_max_reprojection_error_px =
       options.registration.max_reprojection_error_px;
 
@@ -433,11 +612,59 @@ IncrementalMapperSummary RegisterNextImage(
                                       reconstruction);
   summary.registration_seconds = ElapsedSeconds(stage_start);
   if (!summary.registration.success) {
-    summary.message = summary.registration.message;
-    return summary;
+    if (!options.use_structureless_registration) {
+      summary.message = summary.registration.message;
+      return summary;
+    }
+    summary.structureless_registration = EstimateStructurelessPose(
+        graph, image_id, *reconstruction,
+        options.structureless_registration);
+    std::size_t validated_inliers = summary.structureless_registration.success
+        ? ValidateStructurelessPose(graph, image_id, *reconstruction,
+            summary.structureless_registration.pose, options.structureless_registration,
+            options.registration.max_reprojection_error_px) : 0;
+    if (!summary.structureless_registration.success) {
+      // Use match-based resection when pair poses cannot initialize the query.
+      // A coherent pair-pose hypothesis that fails pixel validation must still
+      // be rejected, rather than bypassing that existing consistency check.
+      summary.structureless_registration = EstimateStructurelessPoseFromMatches(
+          graph, image_id, *reconstruction, options.registration,
+          options.structureless_registration);
+      // Generalized resection already verifies the total epipolar constraint
+      // count across distinct centers. Do not reapply the heuristic ray
+      // initializer's fifteen-inlier gate to each contributing camera.
+      auto validation_options = options.structureless_registration;
+      validation_options.min_num_inliers_per_edge = 1;
+      validated_inliers = summary.structureless_registration.success ? ValidateStructurelessPose(
+          graph, image_id, *reconstruction, summary.structureless_registration.pose,
+          validation_options,
+          options.registration.max_reprojection_error_px) : 0;
+    }
+    if (!summary.structureless_registration.success) {
+      summary.message = summary.registration.message + "; " +
+                        summary.structureless_registration.message;
+      return summary;
+    }
+    Image& image = reconstruction->GetImage(image_id);
+    if (validated_inliers < options.registration.min_num_inliers) {
+      summary.message = "Structure-less pose failed multi-view geometric validation";
+      return summary;
+    }
+    image.cam_from_world = summary.structureless_registration.pose;
+    reconstruction->RegisterImage(image_id);
+    summary.used_structureless_registration = true;
+    summary.registration.success = true;
+    summary.registration.num_inliers =
+        validated_inliers;
+    summary.registration.message =
+        "Registered from consistent relative-pose hypotheses";
   }
 
   // 2. 先把新图像能挂到已有 3D 点上的观测补齐，再创建新的 track。
+  LocalBundleAdjustmentScope local_ba_scope;
+  local_ba_scope.first_new_point_id = reconstruction->NextPoint3DId();
+  ScopedPoint3DChanges point_changes(
+      options.run_local_bundle_adjustment ? reconstruction : nullptr);
   stage_start = MappingClock::now();
   summary.track_completion = CompleteTracksForRegisteredImage(
       graph, image_id, options.triangulation, reconstruction);
@@ -452,49 +679,80 @@ IncrementalMapperSummary RegisterNextImage(
           ? &options.local_retriangulation_filter
           : nullptr;
   stage_start = MappingClock::now();
+  const auto local_window = FindLocalBundleImages(
+      *reconstruction, image_id, options.local_bundle_adjustment.max_num_images);
   summary.local_retriangulation = RetriangulateLocalNeighborhood(
       graph, image_id, options.triangulation, local_retriangulation_filter,
-      reconstruction, triangulator_cache);
+      reconstruction, triangulator_cache, &local_window);
   summary.local_retriangulation_seconds = ElapsedSeconds(stage_start);
+  local_ba_scope.modified_point_ids = point_changes.Finish();
 
-  // 3. 对新图像及其共视邻域做局部 BA，消化 PnP 和三角化带来的误差。
-  if (options.run_local_bundle_adjustment) {
-    stage_start = MappingClock::now();
-    summary.local_bundle_adjustment = AdjustLocalBundle(
-        image_id, options.local_bundle_adjustment, reconstruction);
-    summary.local_bundle_adjustment_seconds = ElapsedSeconds(stage_start);
-    if (!summary.local_bundle_adjustment.success) {
-      summary.message = summary.local_bundle_adjustment.message;
-      return summary;
+  // Refine the same changed-point scope until observation membership stabilizes.
+  // COLMAP uses a robust loss for the first pass and quadratic loss afterwards.
+  auto local_ba_options = options.local_bundle_adjustment;
+  const std::size_t max_refinements = options.run_local_bundle_adjustment
+      ? options.ba_local_max_refinements : 1;
+  for (std::size_t pass = 0; pass < max_refinements; ++pass) {
+    ScopedPoint3DChanges refinement_changes(
+        options.run_local_bundle_adjustment ? reconstruction : nullptr);
+    IncrementalTriangulatorSummary post_ba_tracks;
+    if (options.run_local_bundle_adjustment) {
+      stage_start = MappingClock::now();
+      summary.local_bundle_adjustment = AdjustLocalBundle(
+          image_id, local_ba_options, reconstruction, &local_ba_scope);
+      summary.local_bundle_adjustment_seconds += ElapsedSeconds(stage_start);
+      if (!summary.local_bundle_adjustment.success) {
+        summary.message = summary.local_bundle_adjustment.message;
+        return summary;
+      }
+      ++summary.num_local_refinements;
+      stage_start = MappingClock::now();
+      post_ba_tracks = CompleteTracksForRegisteredImage(
+          graph, image_id, options.triangulation, reconstruction);
+      summary.track_completion_seconds += ElapsedSeconds(stage_start);
+      AccumulateTriangulationSummary(post_ba_tracks, &summary.track_completion);
     }
 
-    stage_start = MappingClock::now();
-    const IncrementalTriangulatorSummary post_ba_tracks =
-        CompleteTracksForRegisteredImage(
-            graph, image_id, options.triangulation, reconstruction);
-    summary.track_completion_seconds += ElapsedSeconds(stage_start);
-    AccumulateTriangulationSummary(post_ba_tracks,
-                                   &summary.track_completion);
-  }
-
-  // 4. BA 后过滤坏观测和不稳定 3D 点，减少错误 track 继续污染后续注册。
-  if (options.run_observation_filter) {
-    stage_start = MappingClock::now();
-    std::set<ImageId> adjusted_image_ids =
-        summary.local_bundle_adjustment.local_image_ids;
-    adjusted_image_ids.insert(
-        summary.local_bundle_adjustment.fixed_image_ids.begin(),
-        summary.local_bundle_adjustment.fixed_image_ids.end());
-    if (adjusted_image_ids.empty()) {
-      adjusted_image_ids.insert(image_id);
+    ObservationFilterSummary filtered;
+    if (options.run_observation_filter) {
+      stage_start = MappingClock::now();
+      auto adjusted_image_ids = summary.local_bundle_adjustment.local_image_ids;
+      if (adjusted_image_ids.empty()) adjusted_image_ids.insert(image_id);
+      // Completion can modify points outside the local window. Keep them in
+      // the same work set for filtering and subsequent local refinement.
+      const auto changed_points = refinement_changes.Finish();
+      local_ba_scope.modified_point_ids.insert(changed_points.begin(), changed_points.end());
+      ScopedPoint3DChanges filter_changes(reconstruction);
+      filtered = FilterObservationsAndPointsInImages(
+          options.observation_filter, adjusted_image_ids, reconstruction,
+          &local_ba_scope.modified_point_ids);
+      const auto filtered_points = filter_changes.Finish();
+      local_ba_scope.modified_point_ids.insert(filtered_points.begin(), filtered_points.end());
+      summary.observation_filter_seconds += ElapsedSeconds(stage_start);
+      auto& total = summary.observation_filter;
+      total.success = filtered.success;
+      total.message = filtered.message;
+      total.num_removed_observations += filtered.num_removed_observations;
+      total.num_removed_points += filtered.num_removed_points;
+      total.num_reprojection_observations += filtered.num_reprojection_observations;
+      total.num_invalid_observations += filtered.num_invalid_observations;
+      total.num_short_track_points += filtered.num_short_track_points;
+      total.num_low_angle_points += filtered.num_low_angle_points;
+      if (!filtered.success) {
+        summary.message = filtered.message;
+        return summary;
+      }
+    } else {
+      const auto changed_points = refinement_changes.Finish();
+      local_ba_scope.modified_point_ids.insert(changed_points.begin(), changed_points.end());
     }
-    summary.observation_filter = FilterObservationsAndPointsInImages(
-        options.observation_filter, adjusted_image_ids, reconstruction);
-    summary.observation_filter_seconds = ElapsedSeconds(stage_start);
-    if (!summary.observation_filter.success) {
-      summary.message = summary.observation_filter.message;
-      return summary;
-    }
+    const auto adjusted = summary.local_bundle_adjustment.num_residuals;
+    summary.last_local_refinement_change = adjusted == 0 ? 0.0 :
+        static_cast<double>(post_ba_tracks.num_completed_observations +
+                            post_ba_tracks.num_merged_observations +
+                            filtered.num_removed_observations) / adjusted;
+    if (summary.last_local_refinement_change < options.ba_local_max_refinement_change) break;
+    local_ba_options.loss_scale = 0.0;
   }
 
   summary.success = true;
@@ -508,7 +766,8 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
     const IncrementalTriangulatorOptions& options,
     const ObservationFilterOptions* local_filter_options,
     Reconstruction* reconstruction,
-    const IncrementalTriangulatorCache* triangulator_cache) {
+    const IncrementalTriangulatorCache* triangulator_cache,
+    const std::set<ImageId>* local_window) {
   IncrementalTriangulatorSummary summary;
   summary.image_id = image_id;
   if (reconstruction == nullptr ||
@@ -517,13 +776,15 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
     return summary;
   }
 
-  const std::set<Point3DId> point_ids_before =
-      CollectPoint3DIds(*reconstruction);
+  // This operation only allocates automatic IDs; merges retain an existing ID.
+  // Follow COLMAP's scoped changed-point work sets without copying all points.
+  const Point3DId first_created_point_id = reconstruction->NextPoint3DId();
   std::set<ImageId> local_image_ids;
   local_image_ids.insert(image_id);
   for (const MatchGraphEdge& edge : FindVerifiedNeighbors(graph, image_id)) {
     const ImageId neighbor_id = edge.OtherImageId(image_id);
-    if (reconstruction->IsImageRegistered(neighbor_id)) {
+    if (reconstruction->IsImageRegistered(neighbor_id) &&
+        (local_window == nullptr || local_window->count(neighbor_id) != 0)) {
       local_image_ids.insert(neighbor_id);
     }
   }
@@ -556,7 +817,7 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
 
   if (local_filter_options != nullptr) {
     const ObservationFilterSummary filter_summary = FilterNewlyCreatedPoints(
-        point_ids_before, *local_filter_options, reconstruction);
+        first_created_point_id, *local_filter_options, reconstruction);
     summary.num_filtered_points = filter_summary.num_removed_points;
     summary.num_filtered_observations =
         filter_summary.num_removed_observations;
@@ -604,22 +865,73 @@ std::optional<ImageId> SelectNextImage(
 IncrementalMappingSummary RunIncrementalMapping(
     const MatchGraph& graph,
     const IncrementalMappingOptions& options,
-    Reconstruction* reconstruction) {
+    Reconstruction* reconstruction, InitialPairTrialState* initial_trial_state) {
   IncrementalMappingSummary summary;
   if (reconstruction == nullptr) {
     summary.message = "Reconstruction is null";
     return summary;
   }
 
+  if (!std::isfinite(options.ba_global_frames_ratio) || options.ba_global_frames_ratio <= 1.0 ||
+      !std::isfinite(options.ba_global_points_ratio) || options.ba_global_points_ratio <= 1.0 ||
+      options.ba_global_frames_freq == 0 || options.ba_global_points_freq == 0) {
+    summary.message = "Global BA growth ratios must be finite and > 1; frequencies must be positive";
+    return summary;
+  }
+  if (options.mapper.ba_local_max_refinements == 0 ||
+      !std::isfinite(options.mapper.ba_local_max_refinement_change) ||
+      options.mapper.ba_local_max_refinement_change < 0.0) {
+    summary.message = "Invalid local refinement limit or change threshold";
+    return summary;
+  }
+  const IncrementalTriangulatorCache triangulator_cache(graph);
   if (reconstruction->RegisteredImageIds().empty()) {
+    if (options.initialization.image_id1 != kInvalidImageId &&
+        options.initialization.image_id1 == options.initialization.image_id2) {
+      summary.message = "Initial images must be different";
+      return summary;
+    }
+    if (options.initialization.max_num_reg_trials == 0) {
+      summary.message = "Initial per-image trial limit must be positive";
+      return summary;
+    }
+    if (options.max_num_initialization_trials == 0) {
+      summary.message = "Initial reconstruction trial budget must be positive";
+      return summary;
+    }
+    if (options.run_global_bundle_adjustment) {
+      const auto invalid = options.global_bundle_adjustment.solver.ValidationError(
+          options.global_bundle_adjustment.max_num_iterations);
+      if (!invalid.empty()) { summary.message = invalid; return summary; }
+    }
     IncrementalInitializerOptions initialization_options =
         options.initialization;
     if (!options.allowed_image_ids.empty()) {
       initialization_options.allowed_image_ids = options.allowed_image_ids;
     }
     const auto initialization_start = MappingClock::now();
-    summary.initialization = InitializeReconstructionFromBestPair(
-        graph, initialization_options, reconstruction);
+    InitialPairTrialState owned_trial_state;
+    auto* trial_state = initial_trial_state ? initial_trial_state : &owned_trial_state;
+    std::size_t num_model_trials = 0;
+    summary.initialization = InitializeMappingFromCandidates(
+        graph, initialization_options, triangulator_cache, options, trial_state, &num_model_trials, &summary, reconstruction);
+    // COLMAP retries twice, halving inliers and then angle in each round.
+    // Only the working copy is relaxed; the user's configured thresholds and
+    // cache identity remain unchanged.
+    for (int relaxation = 0; options.relax_initialization_constraints &&
+         !summary.initialization.success && relaxation < 4; ++relaxation) {
+      trial_state->Clear();  // COLMAP ResetInitializationStats for each relaxation.
+      num_model_trials = 0;
+      if (relaxation % 2 == 0) initialization_options.min_num_inliers =
+          std::max<std::size_t>(1, initialization_options.min_num_inliers / 2);
+      else initialization_options.min_triangulation_angle_deg *= 0.5;
+      auto attempt = InitializeMappingFromCandidates(graph, initialization_options,
+          triangulator_cache, options, trial_state, &num_model_trials, &summary, reconstruction);
+      attempt.num_initialization_attempts += summary.initialization.num_initialization_attempts;
+      attempt.attempted_initial_pairs.insert(attempt.attempted_initial_pairs.begin(),
+          summary.initialization.attempted_initial_pairs.begin(), summary.initialization.attempted_initial_pairs.end());
+      summary.initialization = std::move(attempt);
+    }
     summary.initialization_seconds = ElapsedSeconds(initialization_start);
     if (!summary.initialization.success) {
       summary.num_registered_images =
@@ -630,177 +942,265 @@ IncrementalMappingSummary RunIncrementalMapping(
     }
   }
 
-  const IncrementalTriangulatorCache triangulator_cache(graph);
-  std::map<ImageId, std::size_t> registration_trials;
-  for (std::size_t i = 0; i < options.max_num_registrations; ++i) {
-    const auto candidate_start = MappingClock::now();
-    const std::vector<ImageCandidate> candidates =
-        CollectImageCandidates(graph, options.mapper, *reconstruction,
-                               &options.allowed_image_ids,
-                               &registration_trials,
-                               options.max_num_registration_trials_per_image);
-    summary.candidate_selection_seconds += ElapsedSeconds(candidate_start);
-    if (candidates.empty()) {
-      break;
-    }
-
-    bool attempted_any_image = false;
-    bool registered_any_image = false;
-    for (const ImageCandidate& candidate : candidates) {
-      attempted_any_image = true;
-      IncrementalMapperOptions attempt_options = options.mapper;
-      attempt_options.registration = RegistrationOptionsForAttempt(
-          options.mapper.registration, candidate.num_registration_attempts,
-          options);
-      IncrementalMapperSummary registration = RegisterNextImage(
-          graph, candidate.image_id, attempt_options, reconstruction,
+  const auto candidate_neighbors = BuildCandidateNeighborIndex(graph);
+  // Use the same public traversal budget before and after BA. A correspondence
+  // outside the reprojection gate can become attachable only after refinement.
+  const auto& completion_options = options.mapper.triangulation;
+  std::set<refinement_internal::ObservationKey> previously_removed;
+  const bool trace_refinement = options.collect_refinement_diagnostics || VLOG_IS_ON(1);
+  const auto refine_global = [&]() -> bool {
+    ReleaseUnusedMemory();
+    if (options.run_global_track_completion &&
+        reconstruction->RegisteredImageIds().size() >= 2) {
+      auto stage_start = MappingClock::now();
+      const auto completed_tracks = CompleteAndMergeAllTracks(
+          graph, options.mapper.triangulation, reconstruction,
           &triangulator_cache);
-      if (!registration.success) {
-        const std::size_t attempt = ++registration_trials[candidate.image_id];
-        summary.failed_registrations.push_back(MakeFailureSummary(
-            candidate, attempt,
-            attempt_options.registration.max_reprojection_error_px,
-            registration.registration,
-            registration.message));
-        continue;
-      }
-
-      registration.registration_order = summary.registrations.size() + 1;
-      CopyCandidateStatsToSummary(candidate, &registration);
-      summary.registrations.push_back(std::move(registration));
-      registered_any_image = true;
-      break;
-    }
-
-    if (!registered_any_image && !attempted_any_image) {
-      break;
-    }
-  }
-
-  IncrementalTriangulatorOptions bounded_completion_options =
-      options.mapper.triangulation;
-  bounded_completion_options.complete_max_transitivity = std::min(
-      bounded_completion_options.complete_max_transitivity, std::size_t{4});
-
-  if (options.run_global_track_completion &&
-      reconstruction->RegisteredImageIds().size() >= 2) {
-    auto stage_start = MappingClock::now();
-    summary.global_track_completion = CompleteAndMergeAllTracks(
-        graph, options.mapper.triangulation, reconstruction,
-        &triangulator_cache);
-    summary.global_track_completion_seconds += ElapsedSeconds(stage_start);
-    stage_start = MappingClock::now();
-    summary.global_retriangulation = RetriangulateAllRegisteredImages(
-        graph, options.mapper.triangulation, reconstruction,
-        &triangulator_cache);
-    summary.global_retriangulation_seconds = ElapsedSeconds(stage_start);
-    stage_start = MappingClock::now();
-    const IncrementalTriangulatorSummary post_retriangulation_tracks =
-        CompleteAndMergeAllTracks(graph, bounded_completion_options,
-                                  reconstruction, &triangulator_cache);
-    AccumulateTriangulationSummary(post_retriangulation_tracks,
-                                   &summary.global_track_completion);
-    summary.global_track_completion_seconds += ElapsedSeconds(stage_start);
-  }
-
-  if (options.run_global_bundle_adjustment &&
-      reconstruction->RegisteredImageIds().size() >= 2 &&
-      !reconstruction->Points3D().empty()) {
-    auto stage_start = MappingClock::now();
-    summary.global_bundle_adjustment = AdjustGlobalBundle(
-        options.global_bundle_adjustment, reconstruction);
-    summary.global_bundle_adjustment_seconds = ElapsedSeconds(stage_start);
-    if (!summary.global_bundle_adjustment.success) {
-      summary.num_registered_images =
-          reconstruction->RegisteredImageIds().size();
-      summary.num_points3d = reconstruction->Points3D().size();
-      summary.message = summary.global_bundle_adjustment.message;
-      return summary;
-    }
-
-    if (options.run_global_track_completion) {
+      AccumulateTriangulationSummary(completed_tracks, &summary.global_track_completion);
+      summary.global_track_completion_seconds += ElapsedSeconds(stage_start);
       stage_start = MappingClock::now();
-      const IncrementalTriangulatorSummary post_ba_tracks =
-          CompleteAndMergeAllTracks(graph, bounded_completion_options,
+      const auto retriangulated = RetriangulateAllRegisteredImages(
+          graph, options.mapper.triangulation, reconstruction,
+          &triangulator_cache);
+      AccumulateTriangulationSummary(retriangulated, &summary.global_retriangulation);
+      summary.global_retriangulation_seconds += ElapsedSeconds(stage_start);
+      stage_start = MappingClock::now();
+      const IncrementalTriangulatorSummary post_retriangulation_tracks =
+          CompleteAndMergeAllTracks(graph, completion_options,
                                     reconstruction, &triangulator_cache);
-      summary.global_track_completion.num_completed_observations +=
-          post_ba_tracks.num_completed_observations;
-      summary.global_track_completion.num_merged_points +=
-          post_ba_tracks.num_merged_points;
-      summary.global_track_completion.num_merged_observations +=
-          post_ba_tracks.num_merged_observations;
+      AccumulateTriangulationSummary(post_retriangulation_tracks,
+                                     &summary.global_track_completion);
       summary.global_track_completion_seconds += ElapsedSeconds(stage_start);
     }
 
-    if (options.run_pose_guided_track_completion) {
-      stage_start = MappingClock::now();
-      summary.pose_guided_track_completion =
-          CompleteTracksByPoseAndDescriptors(
-              graph, bounded_completion_options, reconstruction);
-      summary.pose_guided_track_completion_seconds =
-          ElapsedSeconds(stage_start);
-      AccumulateTriangulationSummary(summary.pose_guided_track_completion,
-                                     &summary.global_track_completion);
-      summary.global_track_completion_seconds +=
-          summary.pose_guided_track_completion_seconds;
+    const auto count_observations = [&]() {
+      std::size_t count = 0;
+      for (const auto& [id, point] : reconstruction->Points3D()) {
+        count += point.track.Length();
+      }
+      return count;
+    };
+    const std::size_t max_refinements = options.run_final_global_bundle_adjustment
+        ? options.max_num_global_refinements
+        : std::min<std::size_t>(1, options.max_num_global_refinements);
+    if (options.run_global_bundle_adjustment &&
+        reconstruction->RegisteredImageIds().size() >= 2) {
+      for (std::size_t pass = 0; pass < max_refinements &&
+           !reconstruction->Points3D().empty(); ++pass) {
+        const auto observations_before = count_observations();
+        GlobalRefinementDiagnostics row;
+        row.iteration = summary.num_global_refinements + 1;
+        row.observations_before = observations_before;
+        const auto before_state = trace_refinement ? refinement_internal::Capture(*reconstruction)
+                                                  : refinement_internal::Snapshot{};
+        ReleaseUnusedMemory();
+        auto stage_start = MappingClock::now();
+        FilterObservationsWithNegativeDepth(reconstruction);
+        const auto ba = AdjustGlobalBundle(MappingGlobalBundleOptions(options, *reconstruction),
+                                          reconstruction);
+        if (summary.num_global_refinements == 0) {
+          summary.global_bundle_adjustment = ba;
+          summary.global_bundle_adjustment_seconds += ElapsedSeconds(stage_start);
+        } else {
+          summary.final_global_bundle_adjustment = ba;
+          summary.final_global_bundle_adjustment_seconds += ElapsedSeconds(stage_start);
+        }
+        ++summary.num_global_refinements;
+        summary.num_global_ba_invalid_steps += ba.num_invalid_steps;
+        if (!ba.success) {
+          summary.num_registered_images = reconstruction->RegisteredImageIds().size();
+          summary.num_points3d = reconstruction->Points3D().size();
+          summary.message = ba.message;
+          return false;
+        }
+        row.initial_cost = ba.initial_cost;
+        if (!options.global_bundle_adjustment.use_position_priors)
+          NormalizeReconstruction(reconstruction);
+        row.final_cost = ba.final_cost;
+        const auto ba_state = trace_refinement ? refinement_internal::Capture(*reconstruction)
+                                              : refinement_internal::Snapshot{};
+
+        std::size_t changed_observations = 0;
+        if (options.run_global_track_completion) {
+          stage_start = MappingClock::now();
+          const auto tracks = CompleteAndMergeAllTracks(
+              graph, completion_options, reconstruction, &triangulator_cache);
+          AccumulateTriangulationSummary(tracks, &summary.global_track_completion);
+          changed_observations += tracks.num_completed_observations +
+                                  tracks.num_merged_observations;
+          row.completed_events += tracks.num_completed_observations;
+          row.merged_observation_events += tracks.num_merged_observations;
+          summary.global_track_completion_seconds += ElapsedSeconds(stage_start);
+        }
+        if (pass == 0 && options.run_pose_guided_track_completion) {
+          stage_start = MappingClock::now();
+          const auto guided_tracks = CompleteTracksByPoseAndDescriptors(
+              graph, completion_options, reconstruction);
+          const double guided_seconds = ElapsedSeconds(stage_start);
+          summary.pose_guided_track_completion_seconds += guided_seconds;
+          AccumulateTriangulationSummary(guided_tracks, &summary.pose_guided_track_completion);
+          AccumulateTriangulationSummary(guided_tracks, &summary.global_track_completion);
+          changed_observations +=
+              guided_tracks.num_completed_observations + guided_tracks.num_merged_observations;
+          row.completed_events += guided_tracks.num_completed_observations;
+          row.merged_observation_events += guided_tracks.num_merged_observations;
+          summary.global_track_completion_seconds += guided_seconds;
+        }
+        row.observations_after_completion = count_observations();
+        const auto completed_state = trace_refinement ? refinement_internal::Capture(*reconstruction)
+                                                     : refinement_internal::Snapshot{};
+        if (options.run_global_observation_filter) {
+          const auto observations_before_filter = count_observations();
+          stage_start = MappingClock::now();
+          const auto filtered = FilterObservationsAndPoints(
+              options.global_observation_filter, reconstruction);
+          summary.global_observation_filter_seconds += ElapsedSeconds(stage_start);
+          summary.global_observation_filter.num_removed_observations += filtered.num_removed_observations;
+          summary.global_observation_filter.num_removed_points += filtered.num_removed_points;
+          summary.global_observation_filter.success = filtered.success;
+          summary.global_observation_filter.message = filtered.message;
+          changed_observations += observations_before_filter - count_observations();
+          row.filtered_observations = observations_before_filter - count_observations();
+          row.removed_reprojection_observations = filtered.num_reprojection_observations;
+          row.removed_invalid_observations = filtered.num_invalid_observations;
+          row.removed_short_track_points = filtered.num_short_track_points;
+          row.removed_low_angle_points = filtered.num_low_angle_points;
+          if (!filtered.success) {
+            summary.message = filtered.message;
+            return false;
+          }
+        }
+        summary.last_global_refinement_change = observations_before == 0 ? 0.0 :
+            static_cast<double>(changed_observations) / observations_before;
+        row.observations_after_filter = count_observations();
+        row.event_change_ratio = summary.last_global_refinement_change;
+        if (trace_refinement) {
+          refinement_internal::Record(before_state, ba_state, completed_state,
+              refinement_internal::Capture(*reconstruction), &previously_removed,
+              &row, &summary.global_observation_changes,
+              options.global_observation_filter.max_reprojection_error_px);
+        }
+        summary.global_refinement_diagnostics.push_back(row);
+        // Newly completed/merged tracks and removed outliers change the BA
+        // objective. Refine it again until the observation set stabilizes.
+        if (summary.last_global_refinement_change < options.global_refinement_change) break;
+      }
     }
 
-    if (options.run_global_observation_filter) {
-      stage_start = MappingClock::now();
-      summary.global_observation_filter = FilterObservationsAndPoints(
-          options.global_observation_filter, reconstruction);
-      summary.global_observation_filter_seconds = ElapsedSeconds(stage_start);
-      if (!summary.global_observation_filter.success) {
-        summary.num_registered_images =
-            reconstruction->RegisteredImageIds().size();
-        summary.num_points3d = reconstruction->Points3D().size();
-        summary.message = summary.global_observation_filter.message;
-        return summary;
-      }
-
-      if (options.run_global_track_completion) {
-        stage_start = MappingClock::now();
-        const IncrementalTriangulatorSummary post_filter_tracks =
-            CompleteAndMergeAllTracks(graph, bounded_completion_options,
-                                      reconstruction, &triangulator_cache);
-        AccumulateTriangulationSummary(post_filter_tracks,
-                                       &summary.global_track_completion);
-        summary.global_track_completion_seconds += ElapsedSeconds(stage_start);
-      }
-    }
-
-    if (options.run_final_global_bundle_adjustment &&
-        reconstruction->RegisteredImageIds().size() >= 2 &&
+    // Final BA and subsequent track merges move points/intrinsics after the
+    // earlier filter. Enforce the configured error/angle gates on saved output.
+    if (options.run_global_observation_filter &&
         !reconstruction->Points3D().empty()) {
-      stage_start = MappingClock::now();
-      summary.final_global_bundle_adjustment = AdjustGlobalBundle(
-          options.global_bundle_adjustment, reconstruction);
-      summary.final_global_bundle_adjustment_seconds =
-          ElapsedSeconds(stage_start);
-      if (!summary.final_global_bundle_adjustment.success) {
-        summary.num_registered_images =
-            reconstruction->RegisteredImageIds().size();
-        summary.num_points3d = reconstruction->Points3D().size();
-        summary.message = summary.final_global_bundle_adjustment.message;
-        return summary;
-      }
-
-      if (options.run_global_track_completion) {
-        stage_start = MappingClock::now();
-        // The final BA changes both camera intrinsics and 3D positions. Run a
-        // conservative all-inlier completion/merge pass on these final
-        // parameters; every added/merged observation is still required to
-        // satisfy the normal 4 px gate, and no point creation occurs here.
-        const IncrementalTriangulatorSummary final_tracks =
-            CompleteAndMergeAllTracks(graph, bounded_completion_options,
-                                      reconstruction, &triangulator_cache);
-        AccumulateTriangulationSummary(final_tracks,
-                                       &summary.global_track_completion);
-        summary.global_track_completion_seconds += ElapsedSeconds(stage_start);
+      const auto stage_start = MappingClock::now();
+      const auto final_filter = FilterObservationsAndPoints(
+          options.global_observation_filter, reconstruction);
+      summary.global_observation_filter_seconds += ElapsedSeconds(stage_start);
+      summary.global_observation_filter.num_removed_observations +=
+          final_filter.num_removed_observations;
+      summary.global_observation_filter.num_removed_points +=
+          final_filter.num_removed_points;
+      summary.global_observation_filter.success = final_filter.success;
+      if (!final_filter.success) {
+        summary.message = final_filter.message;
+        return false;
       }
     }
-  }
+    return true;
+  };
 
+  std::map<ImageId, std::size_t> registration_trials;
+  std::size_t previous_global_images = reconstruction->RegisteredImageIds().size();
+  std::size_t previous_global_points = reconstruction->Points3D().size();
+  bool recovery_attempted = false;
+  bool refined_since_registration = false;
+  while (summary.registrations.size() < options.max_num_registrations) {
+    const auto candidate_start = MappingClock::now();
+    const auto candidates = CollectImageCandidates(
+        graph, options.mapper, *reconstruction, &options.allowed_image_ids,
+        &registration_trials, options.max_num_registration_trials_per_image,
+        &candidate_neighbors);
+    summary.candidate_selection_seconds += ElapsedSeconds(candidate_start);
+    bool registered_any_image = false;
+    for (const auto& candidate : candidates) {
+      IncrementalMapperOptions attempt_options = options.mapper;
+      attempt_options.registration = RegistrationOptionsForAttempt(
+          options.mapper.registration, candidate.num_registration_attempts, options);
+      auto registration = RegisterNextImage(graph, candidate.image_id,
+          attempt_options, reconstruction, &triangulator_cache);
+      if (!registration.success) {
+        const auto attempt = ++registration_trials[candidate.image_id];
+        summary.failed_registrations.push_back(MakeFailureSummary(
+            candidate, attempt, attempt_options.registration.max_reprojection_error_px,
+            registration.registration, registration.message));
+        continue;
+      }
+      registration.registration_order = summary.registrations.size() + 1;
+      CopyCandidateStatsToSummary(candidate, &registration);
+      summary.registrations.push_back(std::move(registration));
+      if (recovery_attempted) ++summary.num_registration_recovery_successes;
+      registered_any_image = true;
+      recovery_attempted = false;
+      refined_since_registration = false;
+      break;
+    }
+    if (registered_any_image) {
+      const auto images = reconstruction->RegisteredImageIds().size();
+      const auto points = reconstruction->Points3D().size();
+      const bool grew = images >= options.ba_global_frames_ratio * previous_global_images ||
+          (images >= previous_global_images && images - previous_global_images >= options.ba_global_frames_freq) ||
+          points >= options.ba_global_points_ratio * previous_global_points ||
+          (points >= previous_global_points && points - previous_global_points >= options.ba_global_points_freq);
+      if (grew && options.run_global_bundle_adjustment && options.max_num_global_refinements > 0 && points > 0) {
+        if (!refine_global()) return summary;
+        ++summary.num_growth_global_refinements;
+        previous_global_images = reconstruction->RegisteredImageIds().size();
+        previous_global_points = reconstruction->Points3D().size();
+        refined_since_registration = true;
+      }
+      continue;
+    }
+
+    // Like COLMAP, refine a stalled model once and retry with the improved
+    // tracks/geometry. Keep configured inlier gates and per-image trial caps.
+    bool has_connected_remainder = false;
+    for (const auto& [image_id, image] : reconstruction->Images()) {
+      if (!image.registered && (options.allowed_image_ids.empty() ||
+          options.allowed_image_ids.count(image_id) != 0) &&
+          AnalyzeImageCandidate(graph, image_id, *reconstruction,
+                                candidate_neighbors).num_registered_neighbors > 0) {
+        has_connected_remainder = true;
+        break;
+      }
+    }
+    bool can_relax_retry = false;
+    for (const auto& candidate : candidates) {
+      const auto failures = registration_trials[candidate.image_id];
+      if (failures == 0 ||
+          (options.max_num_registration_trials_per_image != 0 &&
+           failures >= options.max_num_registration_trials_per_image)) continue;
+      const auto previous = RegistrationOptionsForAttempt(
+          options.mapper.registration, failures - 1, options);
+      const auto next = RegistrationOptionsForAttempt(
+          options.mapper.registration, failures, options);
+      can_relax_retry |= next.max_reprojection_error_px > previous.max_reprojection_error_px;
+    }
+    if (recovery_attempted || !has_connected_remainder ||
+        !options.run_global_bundle_adjustment || options.max_num_global_refinements == 0 ||
+        reconstruction->Points3D().empty()) {
+      // An explicitly enabled threshold schedule changes the next attempt,
+      // even without a global geometry update. Preserve that bounded path.
+      if (can_relax_retry) continue;
+      break;
+    }
+    ++summary.num_registration_recovery_attempts;
+    LOG(INFO) << "Registration stalled: refining "
+              << reconstruction->RegisteredImageIds().size()
+              << " registered images before retry";
+    if (!refine_global()) return summary;
+    recovery_attempted = true;
+    refined_since_registration = true;
+  }
+  if (!refined_since_registration && !refine_global()) return summary;
   summary.num_registered_images = reconstruction->RegisteredImageIds().size();
   summary.num_points3d = reconstruction->Points3D().size();
   summary.success = summary.num_registered_images >= 2;

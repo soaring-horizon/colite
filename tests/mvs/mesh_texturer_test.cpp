@@ -1,14 +1,17 @@
 #include "colite/mvs/mesh_texturer.h"
 
 #include <filesystem>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <string>
 
 #include <gtest/gtest.h>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include "colite/core/camera.h"
+#include "colite/core/parallel.h"
 
 namespace colite::mvs {
 namespace {
@@ -102,6 +105,25 @@ cv::Vec3d SampleAtlas(const TexturedTriangleMesh& textured,
       sample);
   const cv::Vec3b color = sample.at<cv::Vec3b>(0, 0);
   return cv::Vec3d(color[0], color[1], color[2]);
+}
+
+TEST(MeshTextureViewTest, DecodesAtModelResolutionAndPreservesProjection) {
+  const auto root = std::filesystem::temp_directory_path() / "colite_texture_view_loader";
+  std::filesystem::create_directories(root);
+  const auto expected = MakeTextureView();
+  cv::Mat smaller;
+  cv::resize(expected.image, smaller, cv::Size(32, 32), 0, 0, cv::INTER_AREA);
+  ASSERT_TRUE(cv::imwrite((root / "image.png").string(), smaller));
+  const auto loaded = ReadMeshTextureView(expected.geometry, root / "image.png");
+  EXPECT_EQ(loaded.image.cols, 64);
+  EXPECT_EQ(loaded.image.rows, 64);
+  EXPECT_EQ(loaded.geometry.camera.params, expected.geometry.camera.params);
+  EXPECT_EQ(loaded.geometry.image_id, expected.geometry.image_id);
+  EXPECT_THROW(ReadMeshTextureView(expected.geometry, root / "absent.png"), std::runtime_error);
+  auto invalid = expected.geometry;
+  invalid.camera.width = 0;
+  EXPECT_THROW(ReadMeshTextureView(invalid, root / "image.png"), std::invalid_argument);
+  std::filesystem::remove_all(root);
 }
 
 TEST(MeshTexturingOptionsTest, ValidatesParameters) {
@@ -281,6 +303,72 @@ TEST(MeshTexturingTest, LocalSeamLevelingReducesSpatialColorDiscontinuity) {
   EXPECT_LT(corrected_error, uncorrected_error * 0.35);
 }
 
+TEST(MeshTexturingTest, RoundTripsStandardPlyAndAtlas) {
+  MeshTexturingOptions options;
+  options.atlas_size = 64;
+  options.visibility_resolution = 64;
+  const auto textured = TextureMesh(MakeTexturingPlane(), {MakeTextureView()}, options);
+  const auto root = std::filesystem::temp_directory_path() / "colite_textured_ply_io";
+  std::filesystem::remove_all(root);
+  for (const auto type : {TexturedMeshOutputType::kBinary, TexturedMeshOutputType::kText}) {
+    const auto path = root / (type == TexturedMeshOutputType::kBinary ? "bin" : "txt");
+    WriteTexturedTriangleMesh(path, textured, type);
+    EXPECT_FALSE(std::filesystem::exists(path / "mesh.obj"));
+    const auto loaded = ReadTexturedTriangleMesh(path / "mesh.ply");
+    ASSERT_EQ(loaded.face_uvs.size(), textured.face_uvs.size());
+    ASSERT_EQ(loaded.mesh.triangles.size(), textured.mesh.triangles.size());
+    for (std::size_t i = 0; i < loaded.face_uvs.size(); ++i) {
+      EXPECT_TRUE(loaded.face_uvs[i].isApprox(textured.face_uvs[i], 0));
+    }
+    EXPECT_EQ(cv::norm(loaded.texture_atlas, textured.texture_atlas, cv::NORM_INF), 0);
+    const auto size = std::filesystem::file_size(path / "mesh.ply");
+    std::filesystem::resize_file(path / "mesh.ply", size / 2);
+    EXPECT_THROW(ReadTexturedTriangleMesh(path / "mesh.ply"), std::runtime_error);
+  }
+  auto invalid = textured;
+  invalid.face_uvs[0].x() = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_THROW(WriteTexturedTriangleMesh(root / "invalid", invalid), std::invalid_argument);
+  EXPECT_FALSE(std::filesystem::exists(root / "invalid"));
+  EXPECT_EQ(TexturedMeshOutputTypeFromString("tXt"), TexturedMeshOutputType::kText);
+  EXPECT_THROW(TexturedMeshOutputTypeFromString("OBJ"), std::invalid_argument);
+  std::filesystem::remove_all(root);
+}
+
+TEST(MeshTexturingTest, ThreadBudgetsPreserveResultsAndCallerSetting) {
+  auto first = MakeTextureView();
+  auto second = first;
+  second.geometry.image_id = 7;
+  MeshTexturingOptions options;
+  options.atlas_size = 64;
+  const int previous = parallel::getNumThreads();
+  struct Restore { int count; ~Restore() { parallel::setNumThreads(count); } } restore{previous};
+  parallel::setNumThreads(3);
+  options.num_threads = 1;
+  const auto serial = TextureMesh(MakeTexturingPlane(), {first, second}, options);
+  EXPECT_EQ(parallel::getNumThreads(), 3);
+  options.num_threads = 4;
+  const auto threaded = TextureMesh(MakeTexturingPlane(), {first, second}, options);
+  EXPECT_EQ(parallel::getNumThreads(), 3);
+  EXPECT_EQ(serial.face_view_ids, threaded.face_view_ids);
+  ASSERT_EQ(serial.face_uvs.size(), threaded.face_uvs.size());
+  for (std::size_t i = 0; i < serial.face_uvs.size(); ++i) {
+    EXPECT_TRUE(serial.face_uvs[i].isApprox(threaded.face_uvs[i], 0));
+  }
+  EXPECT_EQ(cv::norm(serial.texture_atlas, threaded.texture_atlas, cv::NORM_INF), 0);
+}
+
+TEST(MeshTexturingInteropTest, ReadsNativeColmapBinAndTxt) {
+  const char* fixture = std::getenv("COLITE_NATIVE_TEXTURE_ROOT");
+  if (!fixture) GTEST_SKIP() << "Set COLITE_NATIVE_TEXTURE_ROOT to native COLMAP fixture directory";
+  for (const auto* format : {"bin", "txt"}) {
+    const auto loaded = ReadTexturedTriangleMesh(std::filesystem::path(fixture) / format / "mesh.ply");
+    EXPECT_FALSE(loaded.mesh.triangles.empty());
+    EXPECT_EQ(loaded.face_uvs.size(), loaded.mesh.triangles.size() * 3);
+    EXPECT_FALSE(loaded.texture_atlas.empty());
+    for (const auto& uv : loaded.face_uvs) EXPECT_TRUE(uv.allFinite());
+  }
+}
+
 TEST(MeshTexturingTest, WritesObjMtlAndPng) {
   MeshTexturingOptions options;
   options.atlas_size = 64;
@@ -290,7 +378,7 @@ TEST(MeshTexturingTest, WritesObjMtlAndPng) {
   const std::filesystem::path output =
       std::filesystem::temp_directory_path() / "colite_mesh_texturer_test";
   std::filesystem::remove_all(output);
-  WriteTexturedTriangleMesh(output, textured);
+  WriteTexturedTriangleMesh(output, textured, TexturedMeshOutputType::kBinary, true);
   EXPECT_TRUE(std::filesystem::exists(output / "mesh.obj"));
   EXPECT_TRUE(std::filesystem::exists(output / "mesh.mtl"));
   EXPECT_TRUE(std::filesystem::exists(output / "texture.png"));
@@ -300,6 +388,7 @@ TEST(MeshTexturingTest, WritesObjMtlAndPng) {
   EXPECT_NE(contents.find("mtllib mesh.mtl"), std::string::npos);
   EXPECT_NE(contents.find("vt "), std::string::npos);
   EXPECT_NE(contents.find("usemtl colite_texture"), std::string::npos);
+  object.close();
   std::filesystem::remove_all(output);
 }
 

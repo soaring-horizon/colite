@@ -88,6 +88,8 @@ MultiModelMappingOptions FastOptions() {
   options.mapping.initialization.max_reprojection_error_px = 1.0;
   options.mapping.mapper.registration.min_num_correspondences = 15;
   options.mapping.mapper.registration.min_num_inliers = 15;
+  // These fixtures intentionally contain only disconnected two-view tracks.
+  options.mapping.mapper.triangulation.ignore_two_view_tracks = false;
   options.mapping.run_global_bundle_adjustment = false;
   options.mapping.run_final_global_bundle_adjustment = false;
   options.mapping.mapper.run_local_bundle_adjustment = false;
@@ -95,6 +97,126 @@ MultiModelMappingOptions FastOptions() {
   options.mapping.mapper.run_local_retriangulation_filter = false;
   options.merge_models = false;
   return options;
+}
+
+MatchGraph DisconnectedPairs(std::size_t count) {
+  MatchGraph graph;
+  const Camera camera = MakeCamera();
+  const auto points = ScenePoints();
+  for (std::size_t pair = 0; pair < count; ++pair) {
+    const ImageId first = static_cast<ImageId>(2 * pair + 1);
+    SetFeatures(&graph, first, Project(camera, CameraAt(0.0), points));
+    SetFeatures(&graph, first + 1, Project(camera, CameraAt(1.0), points));
+    SetVerifiedGeometry(&graph, first, first + 1,
+                        Geometry(CameraAt(1.0), points.size()));
+  }
+  return graph;
+}
+
+TEST(ReconstructionManagerTest, KeepsFirstSmallComponentButRejectsLaterSmallModels) {
+  auto options = FastOptions();
+  options.min_num_images_per_model = 10;
+  // Six connected images cap the threshold at three. Every component has
+  // only two images; the first valid one must survive, the others must not.
+  const auto result = RunIncrementalMappingMultiple(
+      DisconnectedPairs(3), options, MakeSchema(6));
+  ASSERT_EQ(result.models.size(), 1U);
+  EXPECT_EQ(result.models.front().RegisteredImageIds(),
+            (std::set<ImageId>{1, 2}));
+  EXPECT_FALSE(result.models.front().Points3D().empty());
+  EXPECT_EQ(result.num_unregistered_images, 4U);
+}
+
+TEST(ReconstructionManagerTest, CapsSizeUsingConnectedImagesRatherThanSchemaSize) {
+  auto options = FastOptions();
+  options.min_num_images_per_model = 10;
+  // Unmatched images do not increase COLMAP's database-cache image count.
+  const auto result = RunIncrementalMappingMultiple(
+      DisconnectedPairs(2), options, MakeSchema(20));
+  ASSERT_EQ(result.models.size(), 2U);
+  EXPECT_EQ(result.num_unregistered_images, 16U);
+}
+
+TEST(ReconstructionManagerTest, ZeroAndOneSizeLimitsKeepAllValidModels) {
+  for (const std::size_t minimum : {0U, 1U}) {
+    auto options = FastOptions();
+    options.min_num_images_per_model = minimum;
+    const auto result = RunIncrementalMappingMultiple(
+        DisconnectedPairs(3), options, MakeSchema(6));
+    EXPECT_EQ(result.models.size(), 3U) << minimum;
+    EXPECT_EQ(result.num_unregistered_images, 0U) << minimum;
+  }
+}
+
+TEST(ReconstructionManagerTest, InitializationTrialBudgetIsSharedAcrossComponents) {
+  for (std::size_t limit : {1U,2U}) {
+    auto options=FastOptions();
+    options.min_num_images_per_model=0;
+    options.mapping.max_num_initialization_trials=limit;
+    const auto result=RunIncrementalMappingMultiple(DisconnectedPairs(3),options,MakeSchema(6));
+    EXPECT_EQ(result.models.size(),limit);
+    EXPECT_EQ(result.num_unregistered_images,6-2*limit);
+  }
+}
+
+TEST(ReconstructionManagerTest, InitializationRelaxationStartsANewTrialRound) {
+  auto options=FastOptions();
+  options.min_num_images_per_model=0;
+  options.mapping.max_num_initialization_trials=1;
+  options.mapping.relax_initialization_constraints=true;
+  const auto result=RunIncrementalMappingMultiple(DisconnectedPairs(3),options,MakeSchema(6));
+  EXPECT_EQ(result.models.size(),3U);
+  EXPECT_EQ(result.num_unregistered_images,0U);
+}
+
+TEST(ReconstructionManagerTest, InitialPairHonorsIgnoreTwoViewTracks) {
+  auto options=FastOptions();
+  options.min_num_images_per_model=0;
+  options.mapping.mapper.triangulation.ignore_two_view_tracks=true;
+  const auto rejected=RunIncrementalMappingMultiple(DisconnectedPairs(1),options,MakeSchema(2));
+  EXPECT_TRUE(rejected.models.empty());
+  EXPECT_EQ(rejected.num_unregistered_images,2U);
+  options.mapping.mapper.triangulation.ignore_two_view_tracks=false;
+  const auto accepted=RunIncrementalMappingMultiple(DisconnectedPairs(1),options,MakeSchema(2));
+  ASSERT_EQ(accepted.models.size(),1U);
+  EXPECT_EQ(accepted.models[0].Points3D().size(),24U);
+}
+
+TEST(ReconstructionManagerTest, NeverKeepsRegisteredCamerasWithoutSparsePoints) {
+  auto options = FastOptions();
+  options.min_num_images_per_model = 0;
+  options.mapping.global_observation_filter.min_track_length = 3;
+  const auto result = RunIncrementalMappingMultiple(
+      DisconnectedPairs(1), options, MakeSchema(2));
+  EXPECT_TRUE(result.models.empty());
+  EXPECT_EQ(result.num_unregistered_images, 2U);
+}
+
+TEST(ReconstructionManagerTest, UsesFloorOfHalfTheConnectedImageCount) {
+  auto graph = DisconnectedPairs(2);
+  const auto points = ScenePoints();
+  SetFeatures(&graph, 5, Project(MakeCamera(), CameraAt(.5), points));
+  SetVerifiedGeometry(&graph, 1, 5, Geometry(CameraAt(.5), points.size()));
+  SetVerifiedGeometry(&graph, 2, 5, Geometry(CameraAt(-.5), points.size()));
+  auto options = FastOptions();
+  options.min_num_images_per_model = 10;
+  const auto result = RunIncrementalMappingMultiple(graph, options, MakeSchema(5));
+  ASSERT_EQ(result.models.size(), 2U);
+  EXPECT_EQ(result.models[0].RegisteredImageIds().size(), 3U);
+  EXPECT_EQ(result.models[1].RegisteredImageIds().size(), 2U);
+}
+
+TEST(ReconstructionManagerTest, SkipsUninitializableComponentBeforeKeepingFirstModel) {
+  auto options = FastOptions();
+  options.min_num_images_per_model = 10;
+  auto graph = DisconnectedPairs(3);
+  // The first pair remains connected but cannot triangulate any points.
+  graph.verified_geometries.at(ImagePair::Ordered(1, 2)).cam2_from_cam1 = Pose3{};
+  const auto result = RunIncrementalMappingMultiple(graph, options, MakeSchema(6));
+  ASSERT_EQ(result.models.size(), 1U);
+  EXPECT_EQ(result.models.front().RegisteredImageIds(),
+            (std::set<ImageId>{3, 4}));
+  EXPECT_EQ(result.num_unregistered_images, 4U);
 }
 
 TEST(ReconstructionManagerTest, ReconstructsDisconnectedComponentsAsModels) {

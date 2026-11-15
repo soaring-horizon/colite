@@ -1,0 +1,27 @@
+file(READ "${CMAKE_CURRENT_LIST_DIR}/../version.json" _colite_version_json)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/../version.json")
+string(JSON COLITE_VERSION GET "${_colite_version_json}" version)
+string(JSON _colite_prerelease GET "${_colite_version_json}" prerelease)
+if(NOT COLITE_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$" OR NOT _colite_prerelease MATCHES "^[a-zA-Z0-9.]*$")
+  message(FATAL_ERROR "Invalid version.json")
+endif()
+set(COLITE_RELEASE_VERSION "${COLITE_VERSION}")
+if(_colite_prerelease)
+  string(APPEND COLITE_RELEASE_VERSION "-${_colite_prerelease}")
+endif()
+string(REPLACE "." "," COLITE_VERSION_RESOURCE "${COLITE_VERSION}")
+string(APPEND COLITE_VERSION_RESOURCE ",0")
+# Source archives have no Git directory. Release builds pass the frozen revision.
+if(NOT COLITE_SOURCE_REVISION)
+  execute_process(COMMAND git rev-parse --short=12 HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/.."
+    OUTPUT_VARIABLE COLITE_SOURCE_REVISION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+if(NOT COLITE_SOURCE_REVISION)
+  set(COLITE_SOURCE_REVISION "unknown")
+endif()
+if(NOT COLITE_SOURCE_REVISION MATCHES "^[a-zA-Z0-9._-]+$")
+  message(FATAL_ERROR "Invalid COLITE_SOURCE_REVISION")
+endif()
+configure_file("${CMAKE_CURRENT_LIST_DIR}/colite_release.h.in"
+  "${CMAKE_BINARY_DIR}/generated/colite_release.h" @ONLY)

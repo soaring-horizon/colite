@@ -601,7 +601,7 @@ bool ProjectPointWithCameraParams(CameraModelId model_id,
                                   const Eigen::Vector3d& point_camera,
                                   Eigen::Vector2d* projected) {
   if (projected == nullptr || !point_camera.allFinite() ||
-      point_camera.z() <= std::numeric_limits<double>::epsilon() ||
+      point_camera.z() < std::numeric_limits<double>::epsilon() ||
       !CameraModelProjectionImplemented(model_id) ||
       !ParamsAreNumericallyValid(model_id, params)) {
     return false;
@@ -807,6 +807,16 @@ Eigen::Vector2d ProjectPoint(const Camera& camera,
 Eigen::Vector3d UnprojectPixel(const Camera& camera,
                                const Eigen::Vector2d& pixel,
                                double depth) {
+  const auto point = TryUnprojectPixel(camera, pixel, depth);
+  if (!point) {
+    throw std::domain_error(
+        "Pixel cannot be unprojected for this camera model and parameters.");
+  }
+  return *point;
+}
+
+std::optional<Eigen::Vector3d> TryUnprojectPixel(
+    const Camera& camera, const Eigen::Vector2d& pixel, double depth) {
   RequireValidParams(camera);
   if (!std::isfinite(depth) || depth <= 0.0) {
     throw std::invalid_argument("Depth must be positive.");
@@ -814,8 +824,7 @@ Eigen::Vector3d UnprojectPixel(const Camera& camera,
   Eigen::Vector3d point_camera;
   if (!UnprojectPixelWithCameraParams(camera.model_id, camera.params.data(),
                                       pixel, depth, &point_camera)) {
-    throw std::domain_error(
-        "Pixel cannot be unprojected for this camera model and parameters.");
+    return std::nullopt;
   }
   return point_camera;
 }

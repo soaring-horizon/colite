@@ -115,7 +115,28 @@ void Reconstruction::AddPoint3D(Point3D point3d) {
   }
 
   next_point3d_id_ = std::max(next_point3d_id_, point3d.id + 1);
+  MarkPoint3DChanged(point3d.id);
   points3d_.emplace(point3d.id, std::move(point3d));
+}
+
+void Reconstruction::BeginPoint3DChangeTracking() {
+  if (track_point3d_changes_) {
+    throw std::logic_error("Point3D change tracking is already active.");
+  }
+  changed_point3d_ids_.clear();
+  track_point3d_changes_ = true;
+}
+
+std::set<Point3DId> Reconstruction::EndPoint3DChangeTracking() {
+  track_point3d_changes_ = false;
+  std::set<Point3DId> result;
+  result.swap(changed_point3d_ids_);
+  return result;
+}
+
+void Reconstruction::MarkPoint3DChanged(Point3DId point3d_id) {
+  ++point3d_change_version_;
+  if (track_point3d_changes_) changed_point3d_ids_.insert(point3d_id);
 }
 
 bool Reconstruction::DeleteObservation(Point3DId point3d_id,
@@ -141,6 +162,7 @@ bool Reconstruction::DeleteObservation(Point3DId point3d_id,
     }
   }
   point3d.track.elements.erase(element_it);
+  MarkPoint3DChanged(point3d_id);
   return true;
 }
 
@@ -163,6 +185,7 @@ bool Reconstruction::DeletePoint3D(Point3DId point3d_id) {
     }
   }
   points3d_.erase(point_it);
+  MarkPoint3DChanged(point3d_id);
   return true;
 }
 

@@ -4,6 +4,7 @@ set -euo pipefail
 sudo apt update
 sudo apt install -y \
   build-essential \
+  python3 \
   cmake \
   ninja-build \
   pkg-config \
